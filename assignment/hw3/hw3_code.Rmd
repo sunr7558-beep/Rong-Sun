@@ -1,0 +1,1467 @@
+---
+title: 'BIS568: Homework 3'
+author: "Rong Sun"
+date: "2025-04-01"
+output:
+  bookdown::pdf_document2:
+    number_sections: true
+    toc: false
+documentclass: article
+fontsize: 12pt
+geometry: margin=0.9in
+link-citations: yes
+linkcolor: blue
+header-includes:
+- \usepackage{float}
+- \usepackage{placeins}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{caption}
+- \captionsetup[table]{labelformat=empty}
+- \captionsetup[table]{skip=10pt}
+- \floatplacement{table}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, result='hold')
+options(tinytex.verbose = TRUE)
+# set working directory
+setwd("D:/Yale_schoolwork/25 SPRING/BIS 568 Applied Artificial Intelligence in Healthcare/HW/HW3")
+```
+
+
+# Introduction
+
+In this assignment, we focus on MLOps and model interpretability while predicting urinary tract infections (UTIs) using the dataset from Yun et al. (2018). Building upon prior work from Programming Assignment #2, we aim to refine our machine learning workflow by implementing structured pipelines for training, validation, and testing. We compare the performance of Logistic Regression and XGBoost models while leveraging MLflow to track model parameters and evaluation metrics.
+
+Beyond model development, we emphasize interpretability by analyzing feature importance. Using the Logistic Regression model, we report odds ratios for the ten most influential variables. Additionally, we apply SHapley Additive exPlanations (SHAP) to generate a feature importance summary, highlight the top 20 contributing features, and visualize the dependence of white blood cell count on model predictions. These insights, along with the generated plots, are logged in MLflow to ensure transparency and reproducibility in our machine learning pipeline.
+
+This assignment integrates predictive modeling with explainability, aligning with best practices in MLOps for robust, interpretable machine learning solutions.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(dplyr)             # For data manipulation
+library(tidyverse)         # For data science workflows
+library(ggplot2)           # For creating visualizations and plots
+library(caret)             # For machine learning modeling and preprocessing
+library(predtools)         # For predictive modeling utilities
+library(magrittr)          # For improved piping operations
+library(Metrics)           # For computing regression and classification metrics
+library(pROC)              # For calculating and plotting AUC-ROC curves
+library(PRROC)             # For computing precision-recall AUC (PR-AUC)
+library(ROCR)              # For ROC curve performance evaluation
+library(xgboost)           # For extreme gradient boosting (XGBoost) models
+library(Matrix)            # For handling sparse matrices (used in XGBoost)
+library(DataExplorer)      # For automated exploratory data analysis
+library(CalibrationCurves) # For generating calibration curves
+library(caTools)           # For splitting data and AUC computation
+library(MASS)              # For stepwise selection
+library(iml)               # For SHAP analysis
+library(knitr)             # For generating tables in R Markdown
+library(kableExtra)        # For enhanced table formatting options in LaTeX
+library(SHAPforxgboost)    # For SHAP interpretation for XGBoost models
+library(shapviz)           # For Visualization of SHAP values
+library(gridExtra)         # For arranging multiple ggplots in a grid layout
+
+################################################################################
+# Database Connection Setup
+################################################################################
+
+# Setup for database
+db_host <- "spinup-db001ec7.cluster-c9ukc6s0rmbg.us-east-1.rds.amazonaws.com"
+db_user <- "introml568"
+db_pass <- "m7bxMRtyMqPbcxyRRGML8"
+db_name <- "urineculture"
+
+# Connect to database
+db_conn <- DBI::dbConnect(RPostgres::Postgres(),
+                          host = db_host,
+                          dbname = db_name,
+                          user = db_user,
+                          password = db_pass,
+                          options="-c search_path=public")
+
+# Clean up workspace (remove sensitive variables)
+rm(db_name, db_host, db_pass, db_user)
+
+################################################################################
+# Data Collection and Processing
+################################################################################
+
+# Load data from database
+raw_data <- tbl(db_conn, 'results') %>% dplyr::collect()
+
+# Drop irrelevant columns
+df <- raw_data %>% dplyr::select(-UCX_abnormal, -split, -alt_diag, -abxUTI)
+
+# Inspect dataset
+# str(df)
+# summary(df)
+# head(df)
+# if (ncol(df) >= 216) {
+#   head(df[, 210:216])
+# }
+
+# Observations:
+# - NA values present
+# - Inconsistent data types
+# - Logical values stored as integers
+
+# Check for redundant variables, i.e. only have NA values
+# which(apply(df, 2, function(x) sum(is.na(x))) == nrow(df))
+
+# Remove redundant variables
+df <- df[, -which(apply(df, 2, function(x) sum(is.na(x))) == nrow(df))]
+
+# Check for only one response
+# which(apply(df, 2, function(x) length(unique(x))) == 1)
+
+# Check for not on likert
+non_likert <- apply(df, 2, function(x) length(unique(x))) > 6
+
+# Check for numeric
+num <- sapply(df, is.numeric)
+
+# Check for binary 
+binary <- apply(df, 2, function(x) sum(c('0', '1') %in%
+                                         unique(x)) == length(unique(x)))
+
+# Convert data types accordingly
+df[, (non_likert & num)] <- sapply(df[, (non_likert & num)], as.numeric)
+df[, !(non_likert & num)] <- sapply(df[, !(non_likert & num)], as.character)
+df[, binary] <- sapply(df[, binary], as.integer)
+df[, binary] <- sapply(df[, binary], as.logical)
+
+# Drop identifier column
+df$id <- NULL
+
+# Clear temporary variables
+rm(num, binary, non_likert, raw_data, db_conn)
+
+################################################################################
+# Functions created and used
+################################################################################
+
+replace_na_with_nr <- function(df) {
+  df[sapply(df, is.character)] <- lapply(df[sapply(df, is.character)], 
+                                         function(x) ifelse(is.na(x), 'not_reported', x))
+  return(df)
+}
+
+evaluate_glm <- function(model, train, test) {
+  
+  # Set up training results
+  train_pred <- predict(model, type = 'response')
+  train_pred_binary <- ifelse(train_pred > 0.5, 1, 0)
+  train_results <- data.frame(y = train$UTI_diag, 
+                              pred = train_pred, 
+                              pred_binary = train_pred_binary)
+  
+  # Set up test results
+  test_pred <- predict(model, test, type = 'response')
+  test_pred_binary <- ifelse(test_pred > 0.5, 1, 0)
+  test_results <- data.frame(y = test$UTI_diag, 
+                             pred = test_pred, 
+                             pred_binary = test_pred_binary)
+  
+  # Calibration plots
+  p1 <- calibration_plot(data = train_results, obs = "y", pred = "pred", 
+                         title = "Calibration Plot - Training")
+  p2 <- calibration_plot(data = test_results, obs = "y", pred = "pred", 
+                         title = "Calibration Plot - Validation")
+  
+  # MSE and RMSE
+  mse_train <- mse(train_results$y, train_results$pred)
+  rmse_train <- rmse(train_results$y, train_results$pred)
+  mse_test <- mse(test_results$y, test_results$pred)
+  rmse_test <- rmse(test_results$y, test_results$pred)
+  mses <- data.frame(MSE = c(mse_train, mse_test), RMSE = c(rmse_train, rmse_test))
+  row.names(mses) <- c("Training", "Validation")
+  
+  # Cross table and confusion matrix
+  cross_table = table(predicted = as.logical(test_results$pred_binary), 
+                      actual = as.logical(test_results$y))
+  confusion <- confusionMatrix(cross_table, positive = "TRUE")
+  results <- list(train_results, test_results)
+  
+  # ROC
+  test_roc <- roc(test_results$y ~ test_results$pred, plot = TRUE, print.auc = TRUE)
+  
+  return(list(train_results, test_results, p1, p2, mses, confusion, test_roc))
+}
+```
+
+# Features selected for analysis
+
+## Data Splitting Process
+
+To ensure robust model evaluation, the dataset was split into three subsets:
+
+- Training Set (70%) – Used to fit the model.
+
+- Validation Set (15%) – Used for hyperparameter tuning and model selection.
+
+- Test Set (15%) – Used for final model evaluation.
+
+The data was initially split into 70% training data and 30% temporary data. The temporary data was then further divided equally into 15% validation data and 15% test data using stratified sampling based on the UTI diagnosis variable. This approach ensures that the class distribution remains consistent across all subsets. Additionally, missing values were handled by replacing `NA` values in categorical variables with `not_reported` to maintain interpretability, and extreme outliers in urine specific gravity and age were removed using the 1st and 99th percentiles.
+
+## Feature Selection Process
+
+Feature selection was performed through a systematic, multi-stage process to retain the most relevant predictors while ensuring model interpretability and performance. Initially, a logistic regression model was fitted using all available features, including demographic, clinical, and categorical variables. Maximum likelihood estimation (MLE) was used to estimate coefficients, providing an initial assessment of variable significance through p-values and effect sizes. To refine the model, variables with p-values below 0.1 were retained, reducing the risk of prematurely excluding potential predictors.
+
+Further refinement involved backward elimination using likelihood ratio tests (LRT), where the least significant predictors were sequentially removed, provided their exclusion did not significantly worsen model fit. Categorical variables, such as ethnicity and insurance status, were transformed into binary indicators to improve interpretability and avoid misleading ordinal assumptions. Finally, model performance was evaluated using AUC, multicollinearity checks, and predictive accuracy metrics. The final set of predictors was selected based on statistical significance and overall model performance, ensuring a balance between parsimony and predictive power.
+
+## Final Selected Features
+
+Based on Feature importance in the glm we picked these key variables: "ua_bacteria", "ua_clarity", "ua_epi", "ua_wbc", "CVA_tenderness", "psychiatric_confusion", "flank_pain", "age", "gender", "ethnicity_Non_Hispanic", "patid" (retained for potential interpretability). This streamlined feature set ensures that the model remains interpretable while maintaining strong predictive performance ($\text{AUC} \approx 0.81$).
+
+The features given by XGBoost were fairly similar to those selected in the logistic regression model, reinforcing their importance in predicting the target outcome. Based on feature importance ranking from `xgb.importance()`, the top 10 selected features for the XGBoost model include: "abx", "patid", "ua_wbc", "ua_leuk", "ua_nitrite", "ua_bacteria", "dispo", "antibiotics", "age", "chief_complaint". These variables emerged as the most influential in the XGBoost model, aligning closely with the predictors identified through logistic regression, thereby validating their relevance in modeling the outcome.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+################################################################################
+# Preprocessing (Data Split)
+################################################################################
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Step 1: Split data into training (70%) and temporary set (30%)
+split <- sample.split(df$UTI_diag, SplitRatio = 0.7)
+# 70% training data
+train_all <- subset(df, split == TRUE)  
+# 30% temporary data (will be split into validation and testing)
+temp <- subset(df, split == FALSE) 
+
+# Step 2: Split the temporary set into validation (15%) and testing (15%)
+# Split 30% into 15% validation and 15% testing
+split_temp <- sample.split(temp$UTI_diag, SplitRatio = 0.5)  
+validation_all <- subset(temp, split_temp == TRUE)  # 15% validation data
+test_all <- subset(temp, split_temp == FALSE)   # 15% testing data
+
+# Step 3: Verify the sizes of each dataset
+# nrow(train_all)         # Should be ~70% of the original data
+# nrow(validation_all)    # Should be ~15% of the original data
+# nrow(test_all)          # Should be ~15% of the original data
+
+# Step 4: Backup datasets
+train_all_just_in_case <- train_all
+validation_all_just_in_case <- validation_all
+test_all_just_in_case <- test_all
+
+# Initialize manual data selection
+train <- train_all
+validation <- validation_all
+test <- test_all
+
+################################################################################
+############################# Preprocessing ####################################
+################################################################################
+
+# NOTE: This is only for the models tested with manually selected data.
+# XGBoost will use automatically selected variables.
+
+# Extract numeric variables for EDA
+tmp_num <- train[, sapply(train, is.numeric)]
+
+# Check missing values in numeric variables
+# apply(tmp_num, 2, function(x) sum(is.na(x)))  # Not many missing values
+
+# Check correlation between numeric variables
+# cor(na.omit(tmp_num))  # Little collinearity observed
+
+# Identify and remove outliers in selected numeric variables
+t1 <- quantile(tmp_num$ua_spec_grav, c(0.01, .99)) # 1st and 99th percentile
+t2 <- quantile(tmp_num$age, c(0.01, .99)) # 1st and 99th percentile
+
+# Remove extreme outliers (values below 1st percentile or above 99th percentile)
+train <- train[train$ua_spec_grav > t1[1] & train$ua_spec_grav < t1[2], ]
+train <- train[train$age > t2[1] & train$age < t2[2], ]
+
+# Convert categorical variable to character
+train$ua_ph <- as.character(train$ua_ph)
+test$ua_ph <- as.character(test$ua_ph)
+
+# Cleanup temporary variables
+rm(t1, t2, split_temp, tmp_num)
+
+# Selecting mean values from grouped measurements
+measurements <- c('Temp_', 'HR_', 'SBP_', 'DBP_', 'RR_', 'O2_Sat_', 'O2_Amou')
+
+rm_measurements <- function(x, m) {
+  for (i in 1:length(m)) {
+    # Remove the first 4 columns of each measurement type (keeping Mean)
+    x <- x[, -grep(m[i], colnames(x))[1:4]]
+  }
+  # Remove redundant columns for 'O2_Dependency' and 'GCS_'
+  x <- x[, -grep('O2_Depe', colnames(x))[2]]
+  x <- x[, -grep('GCS_', colnames(x))[2]]
+  return(x)
+}
+
+# Apply the function to train, validation and test datasets
+train <- rm_measurements(train, measurements)
+validation <- rm_measurements(validation, measurements)
+test <- rm_measurements(test, measurements)
+
+# Re-check missing values after dropping redundant columns
+# head(sort(apply(train, 2, function(x) sum(is.na(x))), decreasing = TRUE), 10)
+
+# Since all categorical variables are either on a Likert scale or binary (TRUE/FALSE),
+# Replace NA values with 'not_reported' to maintain interpretability.
+
+# Handle missing values by replacing NA with 'not_reported' for categorical variables
+na_to_nr <- function(x) {
+  x[, sapply(x, is.character)][is.na(x[, sapply(x, is.character)])] <- 'not_reported'
+  return(x)
+}
+
+# Check missing values in test dataset before applying transformation
+# head(sort(apply(test, 2, function(x) sum(is.na(x))), decreasing = TRUE), 10)
+
+# Apply missing value replacement to train, validation and test datasets
+train <- na_to_nr(train)
+validation <- na_to_nr(validation)
+test <- na_to_nr(test)
+
+# Summarize dataset after preprocessing
+# plot_intro(train)  # Overview of cleaned training dataset
+# plot_intro(validation)  # Overview of cleaned validation dataset
+# plot_intro(test)   # Overview of cleaned test dataset
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+################################################################################
+# Feature Selection (Manually)
+################################################################################
+
+# Initial logistic regression model using all available predictors
+glm0 <- glm(UTI_diag ~ ., family = binomial, data = train)
+# summary(glm0)
+
+# Selecting variables with p-value < 0.1 for feature refinement
+vals_glm <- c('patid', 'ua_bacteria', 'ua_bili', 'ua_blood', 'ua_clarity', 
+              'ua_color', 'ua_epi', 'ua_glucose', 'ua_ketones', 'ua_leuk', 
+              'ua_nitrite', 'ua_ph', 'ua_rbc', 'ua_urobili', 'ua_wbc', 
+              'CVA_tenderness', 'abd_mass', 'abd_rebound', 'vag_discharge', 
+              'abd_distended2', 'gen_neg', 'pelvic_pain', 'weakness', 
+              'psychiatric_confusion', 'flank_pain', 'diff_urinating', 
+              'dysuria', 'hematuria', 'polyuria', 'chief_complaint', 'age', 
+              'gender', 'ethnicity', 'employStatus', 'insurance_status', 
+              'UTI_diag')
+
+train_glm <- train[, vals_glm]
+
+# Fit logistic regression on the refined set of predictors
+glm1 <- glm(UTI_diag ~ ., family = binomial, data = train_glm)
+# summary(glm1)
+
+# Further variable selection: Removing variables with less significance
+# Excluded: 'abd_rebound', 'ua_ketones', 'pelvic_pain', 'diff_urinating', 'polyuria'
+vals_glm <- c('patid', 'ua_bacteria', 'ua_bili', 'ua_blood', 'ua_clarity', 
+              'ua_color', 'ua_epi', 'ua_glucose', 'ua_leuk', 
+              'ua_nitrite', 'ua_ph', 'ua_rbc', 'ua_urobili', 'ua_wbc', 
+              'CVA_tenderness', 'abd_mass', 'vag_discharge', 
+              'abd_distended2', 'gen_neg', 'weakness', 
+              'psychiatric_confusion', 'flank_pain', 
+              'dysuria', 'hematuria', 'chief_complaint', 'age', 
+              'gender', 'ethnicity', 'employStatus', 'insurance_status', 
+              'UTI_diag')
+
+train_glm <- train[, vals_glm]
+test_glm <- test[, vals_glm]
+validation_glm <- validation[, vals_glm]
+
+# Fit logistic regression after further feature refinement
+glm2 <- glm(UTI_diag ~ ., family = binomial, data = train_glm)
+# summary(glm2)
+
+# Function to convert categorical variables into binary indicators 
+# 'insurance_status', 'ethnicity'
+convert_categorical <- function(x) {
+  x$insurance_status_Medicare <- x[, 'insurance_status'] == 'Medicare'
+  x$ethnicity_Non_Hispanic <- x[, 'ethnicity'] == 'Non-Hispanic'
+  x$insurance_status <- NULL
+  x$ethnicity <- NULL
+  return(x)
+}
+
+# Apply categorical conversion
+train_glm <- convert_categorical(train_glm)
+test_glm <- convert_categorical(test_glm)
+validation_glm <- convert_categorical(validation_glm)
+
+# Fit logistic regression with transformed categorical variables
+glm3 <- glm(UTI_diag ~ ., family = binomial, data = train_glm)
+# summary(glm3)
+
+# Perform backward selection to optimize model
+glm_back <- step(glm3, test = "LRT", trace = 0)  
+
+# Selected variables after backward selection
+val_back <- c('patid' , 'ua_bacteria', 'ua_clarity', 'ua_color', 'ua_epi', 
+              'ua_leuk', 'ua_nitrite', 'ua_urobili', 'ua_wbc', 
+              'CVA_tenderness', 'abd_distended2', 'gen_neg', 
+              'psychiatric_confusion', 'flank_pain', 'dysuria', 'hematuria', 
+              'chief_complaint', 'age', 'gender', 'ethnicity_Non_Hispanic', 
+              'UTI_diag')
+
+# Compare model fit using AIC and BIC
+# AIC(glm_back)  # 43571.79
+# BIC(glm_back)  # 43829.49
+
+# AIC(glm3)   # 40798.76
+# BIC(glm3)   # 41838.44
+
+# Keep only the selected variables in train and test sets
+train <- train_glm[, val_back]
+test <- test_glm[, val_back]
+validation <- validation_glm[, val_back]
+
+# Fit logistic regression on the final refined set of predictors
+glm4 <- glm(UTI_diag ~ ., family = binomial, data = train)
+# summary(glm4)
+
+# Model comparison using ANOVA
+# anova(glm3, glm2)  # Compare glm3 (with transformed categorical variables) to glm2
+# anova(glm4, glm3)  # Compare glm4 (refined model) to glm3
+
+# Model evaluation
+# evaluate_glm(glm4, train, validation)  # AUC=0.8402
+# evaluate_glm(glm4, train, test)  # AUC=0.8438
+
+# **Variable Reduction: Simplified Model**
+# Selecting a subset of the most important variables for a more compact model
+# Initial selection of 15 variables based on p-values from glm4
+val_step <- c('patid', 'ua_bacteria', 'ua_clarity', 'ua_color', 'ua_epi', 
+              'ua_leuk', 'ua_nitrite', 'ua_urobili', 'ua_wbc', 'CVA_tenderness', 
+              'psychiatric_confusion', 'flank_pain', 'age', 'gender', 
+              'ethnicity_Non_Hispanic', 'UTI_diag')
+
+train <- train[, val_step]
+test <- test[, val_step]
+validation <- validation[, val_step]
+
+# Fit logistic regression with the simplified variable set
+glm5 <- glm(UTI_diag ~ ., family = binomial, data = train)
+# summary(glm5)
+
+# **Final Model Selection: Keeping 11 Variables**
+# The 'patid' variable is retained for now, though its relevance is uncertain.
+val_step <- c('patid', 'ua_bacteria', 'ua_clarity', 'ua_epi', 
+              'ua_wbc', 'CVA_tenderness', 'psychiatric_confusion', 
+              'flank_pain', 'age', 'gender', 
+              'ethnicity_Non_Hispanic', 'UTI_diag')
+
+train <- train[, val_step]
+test <- test[, val_step]
+validation <- validation[, val_step]
+
+# Fit logistic regression with 11 selected variables
+glm6 <- glm(UTI_diag~., family=binomial, data=train)
+# summary(glm6)
+
+# Perform another backward selection to ensure model simplicity
+glm_back <- step(glm6, test = 'LRT', trace = 0)  # Automatic feature selection
+
+# **Final Decision:** 
+# Retain CVA_tenderness for interpretability, despite model suggesting removal.
+
+# **Evaluation of Final Model**
+# Achieved AUC of **0.8117** with a streamlined model—strong performance.
+# evaluate_glm(glm6, train, test)
+
+# Top by GLM:
+# 'patid', 'ua_bacteria', 'ua_clarity', 'ua_epi', 
+# 'ua_wbc', 'CVA_tenderness', 'psychiatric_confusion', 
+# 'flank_pain', 'age', 'gender', 
+# 'ethnicity_Non_Hispanic', 'UTI_diag'
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+################################################################################
+# Calculate Odds Ratio (OR) and 95% CI
+################################################################################
+
+# Specify the selected variables
+val_final <- c('patid', 'ua_bacteria', 'ua_clarity', 'ua_epi', 
+               'ua_wbc', 'CVA_tenderness', 'psychiatric_confusion', 
+               'flank_pain', 'age', 'gender', 
+               'ethnicity_Non_Hispanic', 'UTI_diag')
+
+train <- train[, val_final]
+test <- test[, val_final]
+validation <- validation[, val_final]
+
+# Fit logistic regression with the selected variables
+glm_final <- glm(UTI_diag~., family=binomial, data=train)
+# summary(glm_final)
+
+# Calculate odds ratios and 95% confidence intervals
+fitOR <- exp(cbind(OR = coef(glm_final), confint(glm_final)))
+
+# Save results
+saveRDS(fitOR, 'OR.RDS')
+
+# Print top 10 variables based on OR magnitude
+fitOR_sorted <- fitOR[order(-fitOR[, 1]), ]  # Sort by OR in descending order
+# print(head(fitOR_sorted, 10))  # Display top 10 variables
+```
+
+```{r, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Convert fitOR to a data frame to ensure compatibility with kable
+fitOR <- data.frame(fitOR)
+
+# Generate a LaTeX-formatted table for all variables
+kable(
+  fitOR, 
+  booktabs = TRUE, align = "c",
+  col.names = c("Variable", "Odds Ratio (OR)", "Lower 95% CI", "Upper 95% CI"),
+  caption = "Table 1: Odds Ratios with 95% Confidence Intervals"
+) %>%
+  kable_styling(
+    latex_options = c("striped", "scale_down", "HOLD_position"), 
+    full_width = TRUE
+  ) %>%
+  column_spec(1:4, latex_column_spec = "c")  # Center all columns
+```
+
+```{r, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Select top 10 variables based on odds ratio magnitude
+fitOR_sorted <- data.frame(head(fitOR_sorted, 10))
+
+# Generate a LaTeX-formatted table for the top 10 variables
+kable(
+  fitOR_sorted, 
+  booktabs = TRUE, align = "c",
+  col.names = c("Variable", "Odds Ratio (OR)", "Lower 95% CI", "Upper 95% CI"),
+  caption = "Table 2: Top 10 Variables by Odds Ratio"
+) %>%
+  kable_styling(
+    latex_options = c("striped", "scale_down", "HOLD_position"), 
+    full_width = TRUE
+  ) %>%
+  column_spec(1:4, latex_column_spec = "c")  # Center all columns
+```
+
+# Model Performance
+
+## GLM Model Performance Evaluation
+
+The logistic regression (GLM) model was assessed using AUC-ROC, Precision-Recall AUC, and Calibration Curve Analysis, with key results summarized below.
+
+1. AUC-ROC Performance (Discrimination Ability): The logistic regression model exhibits strong discriminative performance in classifying UTI-positive and UTI-negative cases, as reflected in the AUC-ROC values of 0.8106 (validation) and 0.8117 (test). Since an AUC above 0.80 is generally considered excellent, these results indicate that the model effectively differentiates between the two classes. The minimal difference between validation and test AUC suggests good generalization and low risk of overfitting. Additionally, the smooth ROC curves further support the model’s stability and reliability in distinguishing cases.
+
+2. Precision-Recall AUC Performance (Handling of Class Imbalance): In imbalanced healthcare datasets, the Precision-Recall (PR) AUC provides critical insights beyond AUC-ROC by focusing on performance in the minority class. The model’s PR AUC scores of 0.6349 (validation) and 0.6352 (test) indicate moderate precision and recall, which is reasonable given the lower prevalence of positive cases. The gap between AUC-ROC and PR AUC suggests that while the model ranks observations well, precision could be improved without sacrificing recall. Enhancing positive case detection may require adjusting classification thresholds, incorporating weighted loss functions, or applying resampling techniques to better balance the dataset.
+
+3. Calibration Curve Analysis (Reliability of Predicted Probabilities): The model’s probability predictions align well with observed event frequencies, as confirmed by binned calibration plots and val.prob calibration curves. No systematic overestimation or underestimation trends were observed, with the calibration curve closely following the diagonal reference line. This suggests that the model generates well-calibrated probability estimates, making its outputs interpretable and trustworthy for clinical decision-making without requiring extensive post-processing adjustments.
+
+4. Potential Areas for Enhancement: While the model demonstrates strong performance, further optimization could improve precision and recall. Strategies such as threshold tuning, incorporating additional predictive features, or refining feature engineering may enhance classification accuracy. Despite these potential refinements, the current logistic regression model provides a robust and interpretable foundation for UTI diagnosis, balancing discrimination, calibration, and generalizability effectively.
+
+Therefore, the logistic regression model demonstrates strong discrimination ability (AUC-ROC ~ 0.81), reasonable handling of class imbalance (PR AUC ~ 0.63), and well-calibrated probability predictions. The model is generalizable, as shown by consistent performance across validation and test datasets. While the AUC-ROC suggests excellent predictive capability, enhancements in handling class imbalance could improve performance in identifying UTI cases more effectively.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="AUC-ROC Curve (Logistic Regression)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# Predict Probabilities for Validation and Test Data
+################################################################################
+
+train$predicted_prob <- predict(glm6, train, type = "response")
+validation$predicted_prob <- predict(glm6, validation, type = "response")
+test$predicted_prob <- predict(glm6, test, type = "response")
+
+################################################################################
+# Evaluate AUC-ROC Curve for Validation and Testing Data
+################################################################################
+
+# Compute ROC Curves
+roc_valid <- roc(validation$UTI_diag, validation$predicted_prob)
+roc_test <- roc(test$UTI_diag, test$predicted_prob)
+
+# Plot ROC Curves
+par(mfrow = c(1, 2))  # Side-by-side plots
+plot(roc_valid, col = "blue", lwd = 2, main = "AUC-ROC Curve (Validation)")
+legend("bottomright", legend = paste("AUC =", round(auc(roc_valid), 4)), 
+       col = "blue", lwd = 2)
+
+plot(roc_test, col = "red", lwd = 2, main = "AUC-ROC Curve (Testing)")
+legend("bottomright", legend = paste("AUC =", round(auc(roc_test), 4)), 
+       col = "red", lwd = 2)
+
+# dev.copy(png, "AUC_logistic.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "AUC_logistic.png", width = 1000, height = 500)
+  dev.off()
+})))
+
+# Print AUC Values
+# print(paste("Validation AUC-ROC:", round(auc(roc_valid), 4)))  # 0.8106
+# print(paste("Testing AUC-ROC:", round(auc(roc_test), 4)))  # 0.8117
+
+# The AUC-ROC values for both datasets are very similar and indicate that 
+# the model is good at distinguishing between the classes, with values above 
+# 0.80 suggesting excellent discriminative ability.
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Precision-Recall AUC Curve (Logistic Regression)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# Evaluate Precision-Recall AUC for Validation and Testing Data
+################################################################################
+
+# Convert target variable to numeric
+y_valid_numeric <- as.numeric(validation$UTI_diag)
+y_test_numeric <- as.numeric(test$UTI_diag)
+
+# Compute PR Curves
+pr_valid <- pr.curve(scores.class0 = validation$predicted_prob[y_valid_numeric == 0],  
+                      scores.class1 = validation$predicted_prob[y_valid_numeric == 1],  
+                      curve = TRUE)
+
+pr_test <- pr.curve(scores.class0 = test$predicted_prob[y_test_numeric == 0],  
+                     scores.class1 = test$predicted_prob[y_test_numeric == 1],  
+                     curve = TRUE)
+
+# Plot PR Curves
+par(mfrow = c(1, 2))
+plot(pr_valid, col = "blue", main = "Precision-Recall Curve (Validation)", lwd = 2)
+legend("bottomright", legend = paste("AUC-PR =", round(pr_valid$auc.integral, 4)), 
+       col = "blue", lwd = 2)
+
+plot(pr_test, col = "red", main = "Precision-Recall Curve (Testing)", lwd = 2)
+legend("bottomright", legend = paste("AUC-PR =", round(pr_test$auc.integral, 4)), 
+       col = "red", lwd = 2)
+
+# dev.copy(png, "PR_AUC_logistic.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "PR_AUC_logistic.png", width = 1000, height = 500)
+  dev.off()
+})))
+
+# Print PR AUC Values
+# print(paste("Validation AUC-PR:", round(pr_valid$auc.integral, 4)))  # 0.6349
+# print(paste("Testing AUC-PR:", round(pr_test$auc.integral, 4)))  # 0.6352
+
+# The PR AUC values are relatively high, especially considering the class 
+# imbalance often present in healthcare datasets. This suggests that the model 
+# is performing well, even for the less frequent class, by correctly identifying 
+# positive instances.
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Calibration Curve (Logistic Regression - prob)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# Evaluate Calibration Curve for Validation and Testing Data
+################################################################################
+
+# Function to compute and plot calibration curve
+plot_calibration_curve <- function(pred_probs, true_labels, dataset_name) {
+  # Compute calibration curve manually
+  bin_cutoffs <- quantile(pred_probs, probs = seq(0, 1, length.out = 11))  # 10 bins
+  bin_labels <- cut(pred_probs, breaks = bin_cutoffs, include.lowest = TRUE, labels = FALSE)
+
+  # Aggregate observed proportions per bin
+  cal_data <- data.frame(
+    bin = bin_labels,
+    predicted = pred_probs,
+    observed = true_labels
+  )
+
+  cal_summary <- aggregate(observed ~ bin, data = cal_data, FUN = mean)
+  cal_summary$predicted <- aggregate(predicted ~ bin, data = cal_data, FUN = mean)$predicted
+
+  # Plot Calibration Curve
+  ggplot(cal_summary, aes(x = predicted, y = observed)) +
+    geom_line(color = "blue") +
+    geom_point(color = "red") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+    labs(title = paste("Calibration Curve (", dataset_name, ")", sep = ""),
+         x = "Predicted Probability",
+         y = "Observed Proportion") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      axis.ticks.x = element_line(),
+      axis.ticks.y = element_line()
+    )
+}
+
+# Plot Calibration Curves for Validation and Testing
+p1 <- plot_calibration_curve(validation$predicted_prob, y_valid_numeric, "Validation")
+p2 <- plot_calibration_curve(test$predicted_prob, y_test_numeric, "Testing")
+grid.arrange(p1, p2, ncol = 2)
+
+# dev.copy(png, "Calibration_logistic_1.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "Calibration_logistic_1.png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Calibration Curve (Logistic Regression - val.prob)", fig.show='hold', fig.pos='htp'}
+# Plot Calibration Curves (val.prob) for Validation and Testing
+par(mfrow = c(1,2))
+cal_curve_valid <- val.prob(validation$predicted_prob, y_valid_numeric, pl = TRUE)
+title(main = "Calibration Curve for Validation (val.prob)")
+
+cal_curve_test <- val.prob(test$predicted_prob, y_test_numeric, pl = TRUE)
+title(main = "Calibration Curve for Testing (val.prob)")
+par(mfrow = c(1,1))
+
+# dev.copy(png, "Calibration_logistic_2.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "Calibration_logistic_2.png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+\newpage
+
+## XGBoost Model Performance Evaluation
+
+The XGBoost model demonstrates strong classification performance, achieving 88.9% validation accuracy and 89.6% test accuracy, indicating effective generalization to unseen data. The consistency between validation and test accuracy suggests that the model is not overfitting and maintains stable performance across datasets.
+
+However, classification accuracy alone does not fully capture model effectiveness, especially in the presence of class imbalance. A more comprehensive evaluation using AUC-ROC, Precision-Recall AUC, feature importance analysis, and calibration plots provides deeper insights into prediction quality. These additional metrics help assess the model’s ability to balance sensitivity and specificity, properly rank predictions, and produce well-calibrated probability estimates.
+
+1. Feature Importance Analysis (Key Drivers of Model Decisions): The top 10 contributing features in the XGBoost model include "abx", "patid", "ua_wbc", "ua_leuk", "ua_nitrite", "ua_bacteria", "dispo", "antibiotics", "age", and "chief_complaint". These variables hold strong clinical relevance, aligning with expectations and reinforcing that the model captures meaningful patterns. The feature importance distribution indicates that a small subset of key predictors dominates decision-making, with diminishing contributions from other variables. This suggests that removing low-importance features may streamline the model while maintaining predictive performance. However, domain expertise remains essential in guiding any feature selection to ensure that clinically relevant factors are retained.
+
+2. AUC-ROC Performance (Discrimination Ability): The model demonstrated excellent discrimination ability, with AUC-ROC values of 0.9348 (validation) and 0.9564 (test), indicating strong performance in distinguishing between positive and negative cases. An AUC above 0.90 is considered outstanding, and the higher AUC on the test set suggests good generalization with minimal overfitting. Both the validation and test ROC curves were smooth, reflecting stable decision boundaries and consistent performance. The minimal difference between AUC values across datasets further supports the model’s robustness. However, while AUC-ROC highlights overall discrimination, it does not address class imbalance, necessitating a closer look at Precision-Recall metrics to assess performance in identifying positive cases.
+
+3. Precision-Recall AUC Performance (Handling of Class Imbalance): The model's Precision-Recall (PR) AUC values were 0.5934 on the validation set and 0.5878 on the test set, reflecting moderate performance in handling class imbalance. These values indicate that while the model ranks cases effectively, its ability to accurately classify the minority class (likely positive cases) remains limited. The gap between the AUC-ROC and PR AUC suggests that while the model is strong in overall discrimination, it faces challenges with precision when identifying the minority class. This highlights the need for further improvements, such as class weighting, threshold tuning, or data balancing techniques like SMOTE, to better capture and classify positive cases.
+
+4. Calibration Curve Analysis (Reliability of Predicted Probabilities): The calibration curves compare predicted probabilities to observed event frequencies, assessing the alignment between the model's confidence and reality. The model is generally well-calibrated, with reliable probability estimates, though slight deviations from the diagonal indicate minor miscalibration. When the curve is below the diagonal, the model is overconfident, assigning probabilities that are too high; when above, it is underconfident, assigning probabilities that are too low. Post-processing techniques like Platt scaling or isotonic regression can improve calibration, ensuring better alignment with actual outcomes. This is crucial for clinical decision-making, where accurate probability estimates guide risk assessments and treatment choices.
+
+Therefore, the XGBoost model demonstrates excellent discrimination ability (AUC-ROC ~ 0.94), moderate handling of class imbalance (PR AUC ~ 0.59), and generally reliable probability predictions. The model is generalizable, as shown by consistent performance across validation and test datasets. While the AUC-ROC suggests strong overall predictive capability, improvements in handling class imbalance could enhance the model’s ability to more effectively classify minority cases, such as positive outcomes.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+################################################################################
+# XGBoost Implementation
+################################################################################
+
+# Preprocessing: Clean and prepare data
+train_all <- train_all_just_in_case
+validation_all <- validation_all_just_in_case
+test_all <- test_all_just_in_case
+
+# Handle missing values
+train_all <- na_to_nr(train_all)
+validation_all <- validation_all_just_in_case
+test_all <- na_to_nr(test_all)
+
+# Replace NA values in categorical variables
+train_all$ua_ph[is.na(train_all$ua_ph)] <- 'not_reported'
+validation_all$ua_ph[is.na(validation_all$ua_ph)] <- 'not_reported'
+test_all$ua_ph[is.na(test_all$ua_ph)] <- 'not_reported'
+
+# Convert data to dataframes
+train_all <- as.data.frame(train_all)
+validation_all <- as.data.frame(validation_all)
+test_all <- as.data.frame(test_all)
+
+# Prepare input features and target variables
+X_train <- data.matrix(train_all[,-ncol(train_all)])
+y_train <- train_all[,ncol(train_all)]
+
+X_validation <- data.matrix(validation_all[,-ncol(validation_all)])
+y_validation <- validation_all[,ncol(validation_all)]
+
+X_test <- data.matrix(test_all[,-ncol(test_all)])   
+y_test <- test_all[,ncol(test_all)]
+
+# Convert the train, validation and test data into XGBoost matrix type
+xgboost_train <- xgb.DMatrix(data=X_train, label=y_train)
+xgboost_validation <- xgb.DMatrix(data=X_validation, label=y_validation)
+xgboost_test <- xgb.DMatrix(data=X_test, label=y_test)
+
+# Train XGBoost Model
+model <- xgboost(data = xgboost_train,           # The data   
+                 max.depth=3,                    # Max depth 
+                 nrounds=50,
+                 objective = "binary:logistic",  # Binary classification with logistic loss
+                 verbose = 0)                    # Suppress training output
+# summary(model)
+
+# Model Evaluation: Confusion Matrix and Accuracy
+# Predict on validation and test sets
+pred_valid <- predict(model, xgboost_validation)
+pred_test <- predict(model, xgboost_test)
+
+# Convert probabilities to binary labels
+pred_valid_binary <- as.factor(ifelse(pred_valid > 0.5, TRUE, FALSE))
+pred_test_binary <- as.factor(ifelse(pred_test > 0.5, TRUE, FALSE))
+
+# Create confusion matrices
+conf_mat_valid <- confusionMatrix(as.factor(y_validation), pred_valid_binary)
+conf_mat_test <- confusionMatrix(as.factor(y_test), pred_test_binary)
+
+# Print confusion matrix results
+# print(conf_mat_valid)
+# print(conf_mat_test)
+
+# Accuracy on Validation and Test
+validation_accuracy <- sum(diag(conf_mat_valid$table)) / sum(conf_mat_valid$table)
+test_accuracy <- sum(diag(conf_mat_test$table)) / sum(conf_mat_test$table)
+
+# print(paste("Validation Accuracy: ", round(validation_accuracy, 4)))  # 0.889
+# print(paste("Test Accuracy: ", round(test_accuracy, 4)))  # 0.896
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Top 20 Feature Importance - XGBoost", fig.show='hold', fig.pos='htp'}
+################################################################################
+# XGBoost Feature Importance Analysis
+################################################################################
+
+# Compute feature importance matrix
+importance_matrix <- xgb.importance(colnames(xgboost_train), model = model)
+
+# Print importance matrix
+# print(importance_matrix)
+
+# Adjust y-axis label position
+par(mgp = c(3, 0, 0))
+
+# Plot top 20 important features
+xgb.plot.importance(importance_matrix[1:20,], 
+                    main = "Top 20 Feature Importance - XGBoost",
+                    xlab = "Importance Score",
+                    ylab = "Features")
+
+# Reset par to default after plotting
+par(mgp = c(3, 1, 0))
+
+# dev.copy(png, "Feature_Importance_XGBoost.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "Feature_Importance_XGBoost.png", width = 1000, height = 500)
+  dev.off()
+})))
+
+# Prepare the data for explanation
+# topvars <- importance_matrix[1:20,]$Feature
+
+# Plot the multi-tree structure of the model
+# xgb.plot.multi.trees(model = model, use.names = FALSE, fill = TRUE)
+
+# Top 10 XGBoost
+# 'abx', 'patid', 'ua_wbc', 'ua_leuk', 'ua_nitrite', 
+# 'ua_bacteria', 'dispo', 'antibiotics', 'age', 'chief_complaint'
+```
+
+```{r, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="SHAP Summary Plot - Top 20 Features", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Analysis for XGBoost Model
+################################################################################
+
+# 1. SHAP Summary Plot (Top 20 Features)
+# Compute SHAP values for the training dataset
+shap_values <- shap.prep(xgb_model = model, X_train = X_train)
+
+# Ensure SHAP values are a data.table
+shap_long <- shap_values  # `shap.prep()` already returns a data.table
+
+# Select top 20 features by mean absolute SHAP value
+top_20_features <- shap_long[, .(mean_shap = mean(abs(value))), 
+                             by = variable][order(-mean_shap)][1:20, variable]
+
+# Filter dataset to include only the top 20 features
+shap_top_20 <- shap_long[variable %in% top_20_features]
+
+# SHAP Summary Plot (Top 20 Features)
+ggplot(shap_top_20, aes(x = value, y = variable, color = value)) +
+  geom_jitter(size = 0.8, alpha = 0.4) +
+  scale_color_viridis_c(option = "magma", direction = -1) +
+  labs(title = "SHAP Summary Plot - Top 20 Features", 
+       x = "SHAP Value (impact on model output)", y = "Feature") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    legend.position = "right",
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# dev.copy(png, "SHAP Summary (Top 20 Features).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Summary (Top 20 Features).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="SHAP Feature Importance - Top 20 Features", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Feature Importance Plot - Top 20 Features
+################################################################################
+
+# 2. SHAP Feature Importance Plot (Top 20 Features)
+# Compute feature importance as mean absolute SHAP values
+shap_importance_df <- shap_long[, .(Importance = mean(abs(value))), by = variable]
+
+# Select top 20 features by importance
+top_20_importance <- shap_importance_df[order(-Importance)][1:20]
+
+# SHAP Feature Importance Plot (Top 20 Features)
+ggplot(top_20_importance, aes(x = reorder(variable, Importance), y = Importance)) +
+  geom_col(fill = viridis::viridis(20, option = "cividis"), color = "black", width = 0.7) +
+  coord_flip() +
+  labs(title = "SHAP Feature Importance - Top 20 Features", 
+       x = "Feature", y = "Mean |SHAP Value| (average impact on model output magnitude)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# dev.copy(png, "SHAP Feature Importance (Top 20 Features).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Feature Importance (Top 20 Features).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, eval=FALSE, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="SHAP Dependence Plot: White Blood Cell Count (ua_wbc)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Dependence Plot for White Blood Cell Count (`ua_wbc`)
+################################################################################
+
+# 3. SHAP Dependence Plot for White Blood Cell Count (`ua_wbc`)
+# Ensure 'ua_wbc' is in the dataset
+if ("ua_wbc" %in% shap_long$variable) {
+  
+  # Extract SHAP values and corresponding feature values
+  shap_wbc <- shap_long[variable == "ua_wbc", .(rfvalue, shap_value = value)]
+  
+  # Plot SHAP dependence
+  ggplot(shap_wbc, aes(x = rfvalue, y = shap_value)) +
+    geom_point(alpha = 0.5, size = 1, color = "blue") +  # Uniform point color
+    geom_smooth(method = "loess", color = "red", linewidth = 1, se = FALSE) +
+    scale_x_continuous(limits = c(1, 6), breaks = 1:6) +  # Set x-axis range
+    labs(title = "SHAP Dependence Plot: White Blood Cell Count (ua_wbc)", 
+         x = "White Blood Cell Count (ua_wbc)", 
+         y = "SHAP Value for ua_wbc") +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+      legend.position = "none",  # Remove legend since color gradient is removed
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 12)
+    )
+} else {
+  print("Warning: 'ua_wbc' not found in SHAP dataset!")
+}
+
+# dev.copy(png, "SHAP Dependence Plot (ua_wbc).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Dependence Plot (ua_wbc).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="AUC-ROC Curve (XGBoost)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# AUC-ROC Curve (XGBoost)
+################################################################################
+
+# Compute ROC Curves
+roc_valid <- roc(y_validation, pred_valid)
+roc_test <- roc(y_test, pred_test)
+
+# Plot ROC Curves
+par(mfrow = c(1, 2))  # Side-by-side plots
+plot(roc_valid, col = "blue", lwd = 2, main = "AUC-ROC Curve (Validation)")
+legend("bottomright", legend = paste("AUC =", round(auc(roc_valid), 4)), 
+       col = "blue", lwd = 2)
+
+plot(roc_test, col = "red", lwd = 2, main = "AUC-ROC Curve (Testing)")
+legend("bottomright", legend = paste("AUC =", round(auc(roc_test), 4)), 
+       col = "red", lwd = 2)
+
+# dev.copy(png, "AUC_XGBoost.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "AUC_XGBoost.png", width = 1000, height = 500)
+  dev.off()
+})))
+
+# Print AUC Values
+# print(paste("Validation AUC-ROC:", round(auc(roc_valid), 4)))  # 0.9348
+# print(paste("Test AUC-ROC:", round(auc(roc_test), 4)))  # 0.9564
+
+# The AUC-ROC values for both validation and test sets are very high (>0.93), 
+# indicating that the model has excellent discriminatory power between the positive and
+# negative classes. The slight improvement in the test set (0.9564) suggests that 
+# the model generalizes well and maintains strong predictive performance on unseen data.
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Precision-Recall AUC Curve (XGBoost)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# Precision-Recall AUC (XGBoost)
+################################################################################
+
+# Compute PR AUC for validation and test
+pr_valid <- pr.curve(scores.class0 = pred_valid[y_validation == 0],  
+                    scores.class1 = pred_valid[y_validation == 1],  
+                    curve = TRUE)
+
+pr_test <- pr.curve(scores.class0 = pred_test[y_test == 0],  
+                   scores.class1 = pred_test[y_test == 1],  
+                   curve = TRUE)
+
+# Plot PR Curves
+par(mfrow = c(1, 2))
+plot(pr_valid, col = "blue", main = "Precision-Recall Curve (Validation)", lwd = 2)
+legend("bottomright", legend = paste("AUC-PR =", round(pr_valid$auc.integral, 4)), 
+       col = "blue", lwd = 2)
+
+plot(pr_test, col = "red", main = "Precision-Recall Curve (Testing)", lwd = 2)
+legend("bottomright", legend = paste("AUC-PR =", round(pr_test$auc.integral, 4)), 
+       col = "red", lwd = 2)
+
+# dev.copy(png, "PR_AUC_XGBoost.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "PR_AUC_XGBoost.png", width = 1000, height = 500)
+  dev.off()
+})))
+
+# Print PR AUC Values
+# print(paste("Validation AUC-PR:", round(pr_valid$auc.integral, 4)))  # 0.5934
+# print(paste("Test AUC-PR:", round(pr_test$auc.integral, 4)))  # 0.5878
+
+# The AUC-PR values are relatively moderate (~0.59), which suggests that while the model 
+# performs well in terms of overall classification (as indicated by AUC-ROC), there may be 
+# some room for improvement in handling class imbalance. AUC-PR is particularly useful when 
+# dealing with imbalanced datasets, as it focuses on the precision-recall tradeoff rather than
+# the overall classification.
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Calibration Curve (XGBoost - prob)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# Calibration Curve (XGBoost)
+################################################################################
+
+# Function to compute and plot calibration curve
+plot_calibration_curve <- function(pred_probs, true_labels, dataset_name) {
+  # Compute calibration curve manually
+  bin_cutoffs <- quantile(pred_probs, probs = seq(0, 1, length.out = 11))  # 10 bins
+  
+  # Aggregate observed proportions per bin
+  bin_labels <- cut(pred_probs, breaks = bin_cutoffs, include.lowest = TRUE, labels = FALSE)
+  cal_data <- data.frame(
+    bin = bin_labels,
+    predicted = pred_probs,
+    observed = true_labels
+  )
+
+  cal_summary <- aggregate(observed ~ bin, data = cal_data, FUN = mean)
+  cal_summary$predicted <- aggregate(predicted ~ bin, data = cal_data, FUN = mean)$predicted
+
+  # Plot Calibration Curve
+  ggplot(cal_summary, aes(x = predicted, y = observed)) +
+    geom_line(color = "blue") +
+    geom_point(color = "red") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+    labs(title = paste("Calibration Curve (", dataset_name, ")", sep = ""),
+         x = "Predicted Probability",
+         y = "Observed Proportion") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      axis.ticks.x = element_line(),
+      axis.ticks.y = element_line()
+    )
+}
+
+# Plot Calibration Curves for Validation and Testing (XGBoost)
+p5 <- plot_calibration_curve(pred_valid, y_validation, "Validation - XGBoost")
+p6 <- plot_calibration_curve(pred_test, y_test, "Testing - XGBoost")
+grid.arrange(p5, p6, ncol = 2)
+
+# dev.copy(png, "Calibration_XGBoost_1.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "Calibration_XGBoost_1.png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="Calibration Curve (XGBoost - val.prob)", fig.show='hold', fig.pos='htp'}
+# Plot Calibration Curves (val.prob) for Validation and Testing (XGBoost)
+par(mfrow = c(1,2))
+cal_curve_valid <- val.prob(pred_valid, y_validation, pl = TRUE)
+title(main = "Calibration Curve for Validation (val.prob)")
+
+cal_curve_test <- val.prob(pred_test, y_test, pl = TRUE)
+title(main = "Calibration Curve for Testing (val.prob)")
+par(mfrow = c(1,1))
+
+# dev.copy(png, "Calibration_XGBoost_2.png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "Calibration_XGBoost_2.png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+\newpage
+
+# Interpretability and Explainability
+
+## Odds Ratios (OR)
+
+Here, we present the odds ratios (OR) along with their 95% confidence intervals for the selected variables in the logistic regression model, highlighting the relative impact of each predictor on the outcome:
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Convert fitOR to a data frame to ensure compatibility with kable
+fitOR <- data.frame(fitOR)
+
+# Generate a LaTeX-formatted table for all variables
+kable(
+  fitOR, 
+  booktabs = TRUE, align = "c",
+  col.names = c("Variable", "Odds Ratio (OR)", "Lower 95% CI", "Upper 95% CI")) %>%
+  kable_styling(latex_options = c("striped", "scale_down", "HOLD_position"), 
+                full_width = TRUE) %>%
+  column_spec(1:4, latex_column_spec = "c")  # Center all columns
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Select top 10 variables based on odds ratio magnitude
+fitOR_sorted <- data.frame(head(fitOR_sorted, 10))
+
+# Generate a LaTeX-formatted table for the top 10 variables
+kable(
+  fitOR_sorted, 
+  booktabs = TRUE, align = "c",
+  col.names = c("Variable", "Odds Ratio (OR)", "Lower 95% CI", "Upper 95% CI"),
+  caption = "\\textbf{Top 10 Variables by Odds Ratios}") %>%
+  kable_styling(latex_options = c("striped", "scale_down", "HOLD_position"), 
+                full_width = TRUE) %>%
+  column_spec(1:4, latex_column_spec = "c")  # Center all columns
+```
+
+1. Interpretability:
+
+- Understanding of Variable Impact: The odds ratios (OR) provide insight into how different clinical variables influence the likelihood of a specific outcome. For instance, variables such as "ua_epinot_reported" (OR = 2.40) and "ua_epismall" (OR = 2.18) significantly increase the likelihood of the event occurring, while variables like "ua_wbcnegative" (OR = 0.12) and "ua_wbcnot_reported" (OR = 0.06) strongly decrease it. The interpretability of these results allows practitioners to understand which features contribute most to the outcome and how they affect predictions.
+
+- Clinical Relevance: Understanding which features drive model predictions is essential for translating statistical findings into clinical practice. The top variables, such as urinary bacteria presence ("ua_bacteriamarked", OR = 1.71) and psychiatric confusion ("psychiatric_confusion1", OR = 1.68), reflect clinically meaningful associations. This ensures that the model aligns with known clinical knowledge and is interpretable within the medical context. By examining odds ratios, clinicians can determine which factors are most predictive and make informed decisions based on those factors.
+
+- Easy Human Prediction: The odds ratios for key predictors (e.g., "age" OR = 1.01) indicate that small increases in variables like age slightly raise the likelihood of the outcome, making the relationship intuitive for clinicians. Since this pattern aligns with clinical expectations, it enhances trust in the model. The straightforward, linear relationship also makes it easier for humans to interpret and predict outcomes.
+
+2. Explainability:
+
+- Clarifying Model Decisions: The odds ratios offer a clear explanation of how each variable contributes to the predicted probability. For example, a unit increase in the variable "ua_epinot_reported" results in a 2.40 times higher chance of the event, providing an easy-to-understand explanation for clinicians and stakeholders. This enhances the overall explainability of the model as clinicians can trace back predictions to individual features.
+
+- Highlighting the Most Impactful Variables: By focusing on the top 10 variables with the highest odds ratios, the model's behavior is made transparent. The significant impact of variables such as "ua_bacteriamarked" (OR = 1.71) and "psychiatric_confusion1" (OR = 1.68) makes it clear which clinical factors are most influential in driving predictions, making the model easier to communicate to non-technical users.
+
+- Post-Hoc Explanation via Feature Analysis: The feature importance table can be used as a post-hoc explanation tool, where the contributions of each variable to the final decision are presented in understandable terms. This is especially useful when explaining the model to clinicians or healthcare professionals who may not be familiar with machine learning techniques. The table breaks down each variable's impact, helping bridge the gap between the model's complex internal workings and human understanding.
+
+3. Practical Application of Interpretability and Explainability: 
+
+- Informed Decision-Making: The odds ratios, along with their confidence intervals, equip healthcare providers with actionable insights. For instance, knowing that "ua_bacteriamarked" has a strong positive association with the event outcome allows practitioners to prioritize this feature when making diagnostic or treatment decisions, ensuring that decisions are based on the most relevant factors.
+
+- Model Refinement: The interpretability of the odds ratios also provides feedback for further refinement. Features with very low odds ratios, such as "ua_wbcnegative" (OR = 0.12), might be reconsidered for exclusion in the model or further investigation, improving model efficiency.
+
+- Transparency and Trust: By being transparent about the relationships between features and predictions, the model builds trust with users. Clinicians are more likely to adopt and rely on the model if they understand how and why certain factors are influencing the outcome, thus enhancing both the practical use and the credibility of the system.
+
+\noindent
+
+## SHAP Analysis
+
+1. SHAP Summary Plot - Top 20 Features
+
+- Interpretability: This plot visualizes the impact of the top 20 most influential features in the model’s predictions and uses color bars to represent the distribution of SHAP values for each feature, where color indicates feature value (ranging from low to high). The length of each bar along the x-axis represents the spread of SHAP values, showing the variability in how much a feature influences predictions. Wider bars indicate features with a larger impact on model predictions, meaning their influence varies significantly across observations.
+
+- Explainability: The summary plot highlights the features the model relies on most for prediction, with the color gradient in the bars indicating whether higher or lower feature values drive the prediction positively or negatively. Some features exhibit a symmetric spread of SHAP values, meaning their effect on predictions can be positive or negative depending on their value and interactions with other features. Features with the widest bars, such as "abx," have the greatest impact on predictions, even if they appear lower on the plot. In contrast, features that are crowded in the middle with narrower bars contribute little to the model’s output.
+
+- Findings: "Patid" and "abx" have the largest range of SHAP values, indicating that their impact on predictions varies widely across individuals. This suggests strong interaction effects and a significant contribution to model uncertainty. In contrast, "ua_wbc" (White Blood Cell Count) is also highly influential but has a narrower SHAP value range, meaning its effect on predictions is more consistent. Higher "ua_wbc" values generally increase risk, while lower values decrease it. Some features exhibit mixed effects, suggesting possible non-linear relationships or interactions. Given their impact, the most important features (particularly "patid" and "abx") should be further examined to understand their clinical or predictive significance and how they drive variability in predictions.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="SHAP Summary Plot - Top 20 Features", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Analysis for XGBoost Model
+################################################################################
+
+# 1. SHAP Summary Plot (Top 20 Features)
+# Compute SHAP values for the training dataset
+shap_values <- shap.prep(xgb_model = model, X_train = X_train)
+
+# Ensure SHAP values are a data.table
+shap_long <- shap_values  # `shap.prep()` already returns a data.table
+
+# Select top 20 features by mean absolute SHAP value
+top_20_features <- shap_long[, .(mean_shap = mean(abs(value))), 
+                             by = variable][order(-mean_shap)][1:20, variable]
+
+# Filter dataset to include only the top 20 features
+shap_top_20 <- shap_long[variable %in% top_20_features]
+
+# SHAP Summary Plot (Top 20 Features)
+ggplot(shap_top_20, aes(x = value, y = variable, color = value)) +
+  geom_jitter(size = 0.8, alpha = 0.4) +
+  scale_color_viridis_c(option = "magma", direction = -1) +
+  labs(title = "SHAP Summary Plot - Top 20 Features", 
+       x = "SHAP Value (impact on model output)", y = "Feature") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    legend.position = "right",
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# dev.copy(png, "SHAP Summary (Top 20 Features).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Summary (Top 20 Features).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+\FloatBarrier
+
+2. SHAP Feature Importance - Top 20 Features
+
+- Interpretability: This bar plot ranks the top 20 features based on their mean absolute SHAP values, reflecting their overall contribution to model predictions. Unlike the summary plot, this visualization does not show directionality but instead provides an aggregate view of feature importance. The higher a feature appears in the ranking, the greater its average impact on model output, making it crucial for prediction consistency.
+
+- Explainability: The feature importance plot allows for direct comparison of the relative importance of different variables in the model. Unlike regression coefficients, SHAP values account for complex interactions, ensuring that features with significant but non-linear effects are properly weighted. This visualization answers the question: *"Which features contribute the most to model predictions?"* and helps prioritize variables for further analysis.
+
+- Findings: The results align with the SHAP summary plot. "abx" ranks as the most important feature, having the highest mean absolute SHAP value, meaning it has the largest average impact on model output magnitude. "patid" follows as the second most critical feature, contributing substantially to prediction variability. "ua_wbc" (White Blood Cell Count) is the third most influential, with its effect being more consistent across observations. The ranking of these features provides a data-driven foundation for prioritizing variables in future modeling, interpretability studies, and clinical evaluations.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.cap="SHAP Feature Importance - Top 20 Features", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Feature Importance Plot - Top 20 Features
+################################################################################
+
+# 2. SHAP Feature Importance Plot (Top 20 Features)
+# Compute feature importance as mean absolute SHAP values
+shap_importance_df <- shap_long[, .(Importance = mean(abs(value))), by = variable]
+
+# Select top 20 features by importance
+top_20_importance <- shap_importance_df[order(-Importance)][1:20]
+
+# SHAP Feature Importance Plot (Top 20 Features)
+ggplot(top_20_importance, aes(x = reorder(variable, Importance), y = Importance)) +
+  geom_col(fill = viridis::viridis(20, option = "cividis"), color = "black", width = 0.7) +
+  coord_flip() +
+  labs(title = "SHAP Feature Importance - Top 20 Features", 
+       x = "Feature", y = "Mean |SHAP Value| (average impact on model output magnitude)") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# dev.copy(png, "SHAP Feature Importance (Top 20 Features).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Feature Importance (Top 20 Features).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+\FloatBarrier
+
+3. SHAP Dependence Plot for White Blood Cell Count (ua_wbc)
+
+- Interpretability: This dependence plot visualizes the relationship between White Blood Cell Count (ua_wbc) and its SHAP value, illustrating how changes in ua_wbc influence model predictions. Each point represents an individual instance, and the trend line (loess smoothing) captures the overall pattern of feature impact. The spread of points at each ua_wbc level indicates the presence of interactions with other features.
+
+- Explainability: The plot reveals that the effect of ua_wbc on predictions is non-linear. From ua_wbc values of approximately 1 to 4, the smoothed trend line shows a downward pattern, suggesting that lower ua_wbc levels increase the model's predicted risk. Between 4 and 6, the trend stabilizes, forming a nearly horizontal line with a slight upward curvature at the end, indicating minimal but slightly increasing influence on predictions at higher ua_wbc values. The variation in SHAP values at the same ua_wbc level suggests interactions with other variables, influencing the magnitude of its effect.
+
+- Findings: The non-linear relationship between ua_wbc and SHAP values highlights a threshold effect, where lower ua_wbc levels (1–4) have a stronger negative impact on predictions, while values above 4 exhibit a more stable influence. This pattern suggests that ua_wbc's predictive role may depend on interactions with other features, warranting further investigation into its clinical or modeling significance.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="SHAP Dependence Plot: White Blood Cell Count (ua_wbc)", fig.show='hold', fig.pos='htp'}
+################################################################################
+# SHAP Dependence Plot for White Blood Cell Count (`ua_wbc`)
+################################################################################
+
+# 3. SHAP Dependence Plot for White Blood Cell Count (`ua_wbc`)
+# Ensure 'ua_wbc' is in the dataset
+if ("ua_wbc" %in% shap_long$variable) {
+  
+  # Extract SHAP values and corresponding feature values
+  shap_wbc <- shap_long[variable == "ua_wbc", .(rfvalue, shap_value = value)]
+  
+  # Plot SHAP dependence
+  ggplot(shap_wbc, aes(x = rfvalue, y = shap_value)) +
+    geom_point(alpha = 0.5, size = 1, color = "blue") +  # Uniform point color
+    geom_smooth(method = "loess", color = "red", linewidth = 1, se = FALSE) +
+    scale_x_continuous(limits = c(1, 6), breaks = 1:6) +  # Set x-axis range
+    labs(title = "SHAP Dependence Plot: White Blood Cell Count (ua_wbc)", 
+         x = "White Blood Cell Count (ua_wbc)", 
+         y = "SHAP Value for ua_wbc") +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+      legend.position = "none",  # Remove legend since color gradient is removed
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 12)
+    )
+} else {
+  print("Warning: 'ua_wbc' not found in SHAP dataset!")
+}
+
+# dev.copy(png, "SHAP Dependence Plot (ua_wbc).png", width = 1000, height = 500)
+# dev.off()
+
+suppressMessages(suppressWarnings(invisible({
+  dev.copy(png, "SHAP Dependence Plot (ua_wbc).png", width = 1000, height = 500)
+  dev.off()
+})))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+################################################################################
+# Log training parameters, metrics, and figures to MLFlow
+################################################################################
+
+# Load necessary libraries
+library(reticulate)   # For interface between R and Python
+library(mlflow)       # For track experiments and manage ML models
+
+# Activate the Conda environment
+reticulate::use_condaenv("bis568ops", required=TRUE)
+
+# Set the correct path to mlflow executable
+Sys.setenv(PATH = paste("E:/miniconda3/envs/bis568ops/Scripts",
+                        Sys.getenv("PATH"), sep = ";"))
+
+# Verify the path has been set correctly
+Sys.getenv("PATH")
+
+# Launch mlflow UI
+# mlflow::mlflow_set_tracking_uri("http://127.0.0.1:5000")
+mlflow::mlflow_ui()
+
+################################################################################
+# Logistic Regression Model
+################################################################################
+
+mlflow::mlflow_start_run()
+
+# Log parameters (selected features)
+selected_features <- paste(names(train)[-ncol(train)], collapse=", ")
+mlflow::mlflow_log_param("model_type", "logistic_regression")
+mlflow::mlflow_log_param("selected_features", selected_features)
+# mlflow::mlflow_log_param("selected_features", "ua_bacteria, ua_clarity, ua_epi,
+#                          ua_wbc, CVA_tenderness, psychiatric_confusion, flank_pain,
+#                          age, gender, ethnicity_Non_Hispanic")
+
+# Log metrics
+mlflow::mlflow_log_metric("roc_valid", 0.8106)
+mlflow::mlflow_log_metric("roc_test", 0.8117)
+mlflow::mlflow_log_metric("pr_valid", 0.6349)
+mlflow::mlflow_log_metric("pr_test", 0.6352)
+
+# Log artifacts (figures)
+mlflow::mlflow_log_artifact("AUC_logistic.png")
+mlflow::mlflow_log_artifact("PR_AUC_logistic.png")
+mlflow::mlflow_log_artifact("Calibration_logistic_1.png")
+mlflow::mlflow_log_artifact("Calibration_logistic_2.png")
+
+# Properly log the GLM model
+mlflow::mlflow_log_model(
+  model = carrier::crate(
+    function(new_data) {
+      predict(!!glm6, newdata = new_data, type = "response")
+    },
+    glm6 = glm6
+  ),
+  artifact_path = "logistic_model"
+)
+
+mlflow::mlflow_end_run()
+
+################################################################################
+# XGBoost
+################################################################################
+
+mlflow::mlflow_start_run()
+
+# Log model parameters
+mlflow::mlflow_log_param("model_type", "xgboost")
+mlflow::mlflow_log_param("data", "xgboost_train")
+mlflow::mlflow_log_param("max_depth", 3)
+mlflow::mlflow_log_param("nrounds", model$niter)  # Log actual iterations (50)
+mlflow::mlflow_log_param("objective", "binary:logistic")
+mlflow::mlflow_log_param("missing_value_handling", "not_reported")
+
+# Log performance metrics
+# validation_accuracy <- sum(diag(conf_mat_valid$table)) / sum(conf_mat_valid$table)
+# test_accuracy <- sum(diag(conf_mat_test$table)) / sum(conf_mat_test$table)
+# mlflow::mlflow_log_metric("validation_accuracy", validation_accuracy)
+# mlflow::mlflow_log_metric("test_accuracy", test_accuracy)
+# mlflow::mlflow_log_metric("roc_valid", pROC::roc(y_validation, pred_valid)$auc)
+# mlflow::mlflow_log_metric("roc_test", pROC::roc(y_test, pred_test)$auc)
+mlflow::mlflow_log_metric("validation_accuracy", 0.889)
+mlflow::mlflow_log_metric("test_accuracy", 0.896)
+mlflow::mlflow_log_metric("roc_valid", 0.9348)
+mlflow::mlflow_log_metric("roc_test", 0.9564)
+mlflow::mlflow_log_metric("pr_valid", 0.5934)
+mlflow::mlflow_log_metric("pr_test", 0.5878)
+
+# Log confusion matrix metrics
+mlflow::mlflow_log_metric("validation_sensitivity", conf_mat_valid$byClass["Sensitivity"])
+mlflow::mlflow_log_metric("validation_specificity", conf_mat_valid$byClass["Specificity"])
+mlflow::mlflow_log_metric("test_sensitivity", conf_mat_test$byClass["Sensitivity"])
+mlflow::mlflow_log_metric("test_specificity", conf_mat_test$byClass["Specificity"])
+
+# Log top features
+top_features <- importance_matrix[1:10, Feature]
+mlflow::mlflow_log_param("top_10_features", paste(top_features, collapse = ", "))
+
+# Log all visualization artifacts
+mlflow::mlflow_log_artifact("Feature_Importance_XGBoost.png")
+mlflow::mlflow_log_artifact("SHAP Summary (Top 20 Features).png")
+mlflow::mlflow_log_artifact("SHAP Feature Importance (Top 20 Features).png")
+mlflow::mlflow_log_artifact("SHAP Dependence Plot (ua_wbc).png")
+mlflow::mlflow_log_artifact("AUC_XGBoost.png")
+mlflow::mlflow_log_artifact("PR_AUC_XGBoost.png")
+mlflow::mlflow_log_artifact("Calibration_XGBoost_1.png")
+mlflow::mlflow_log_artifact("Calibration_XGBoost_2.png")
+
+# Properly log the XGBoost model
+mlflow::mlflow_log_model(
+  model = carrier::crate(
+    function(new_data) {
+      predict(!!model, as.matrix(new_data))
+    },
+    model = model
+  ),
+  artifact_path = "xgboost_model"
+)
+
+mlflow::mlflow_end_run()
+```
+

@@ -1,4 +1,4 @@
-Situation: Stakeholders required scalable, reproducible reports on glioma patient data.
-Task: Create an interactive visualization platform with validation and export features.
-Action: Preprocessed and validated patient data, designed modular Shiny dashboard, integrated UI/UX improvements, added export and reporting functionality.
-Result: Reduced manual reporting effort by ~40%, improved reproducibility and accessibility of clinical data insights.
+- Situation: Stakeholders required scalable, reproducible reports on glioma patient data.
+- Task: Create an interactive visualization platform with validation and export features.
+- Action: Preprocessed and validated patient data, designed modular Shiny dashboard, integrated UI/UX improvements, added export and reporting functionality.
+- Result: Reduced manual reporting effort by ~40%, improved reproducibility and accessibility of clinical data insights.

@@ -1,0 +1,958 @@
+---
+title: "Homework 6"
+author: "Rong Sun"
+date: "2024-11-11"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# set working directory
+setwd('D:/Yale_schoolwork/BIS 679 Advanced Statistical Programming in SAS and R/Homework/HW6')
+```
+
+# Load necessary packages
+
+```{r, message=FALSE, warning=FALSE}
+# Load necessary packages
+library(readxl)      # For reading Excel files
+library(dplyr)       # For data manipulation
+library(lubridate)   # For working with date and time objects
+library(stringr)     # For string manipulation functions
+library(forcats)     # For factor manipulation
+library(labelled)    # For handling variable labels in data frames
+library(ggplot2)     # For creating data visualizations
+library(DT)          # For creating an interactive data table
+library(shiny)       # For building interactive web applications
+library(shinydashboard)    # For creating a dashboard layout
+library(scales)      # For formatting numbers as percentages
+library(RColorBrewer)  # For color palettes
+```
+
+# Load the Dataset
+
+```{r}
+# Import the xls file into R data frame
+glioma_data <- read_excel("glioma679.xls", sheet = "Glioma", range = "A1:H201")
+
+# View the original dataset
+head(glioma_data)
+
+# View the class of each variable
+lapply(glioma_data, class)
+```
+
+# Data Processing (Convert Dates and Create New Variables)
+
+## Data Cleaning
+
+```{r, message=FALSE, warning=FALSE}
+# Rename columns for convenience
+colnames(glioma_data) <- c("Sex", "Race", "Hispanic", "Date_of_first_Glioma_surgery",  
+                           "Interview", "Tumor_counts", "DOB", "Blood_sample")
+
+# Convert Date_of_first_Glioma_surgery to Date format
+glioma_data_adjusted <- glioma_data %>% 
+  mutate(
+    # Trim whitespace from the date column
+    Date_of_first_Glioma_surgery = str_trim(Date_of_first_Glioma_surgery),
+
+    # Check if Date_of_first_Glioma_surgery is missing or has a standard format
+    Date_of_first_Glioma_surgery_num = case_when(
+      
+      # Convert missing to Date type NA
+      is.na(Date_of_first_Glioma_surgery) ~ as.Date(NA),
+
+      # If no '/' symbol, assume numeric and convert from Excel date system
+      !str_detect(Date_of_first_Glioma_surgery, "/") ~ 
+        as.Date(as.numeric(Date_of_first_Glioma_surgery), origin = "1899-12-30"),
+      
+      # If format '9/99/YYYY', retain only year and set to January 1st
+      str_detect(Date_of_first_Glioma_surgery, "^9/99/") ~ 
+        as.Date(paste0("01/01/", substr(Date_of_first_Glioma_surgery, 6, 9)), format = "%m/%d/%Y"),
+      
+      # For specific date to keep, e.g., "06/08/2018"
+      Date_of_first_Glioma_surgery == "06/08/2018" ~ as.Date("2018-06-08"),
+      
+      # Convert all other dates from character to Date
+      TRUE ~ as.Date(Date_of_first_Glioma_surgery, format = "%m/%d/%Y")
+    ),
+
+    # Convert POSIXct to Date
+    DOB = as.Date(DOB),
+    
+    # Convert Hispanic variable to numeric, handling "0?" as missing
+    Hispanic = as.numeric(na_if(Hispanic, "0?"))
+  ) %>%
+  
+  # Drop original date column to avoid redundancy
+  dplyr::select(-Date_of_first_Glioma_surgery) 
+
+# View the adjusted dataset
+head(glioma_data_adjusted)
+
+# View the class of each variable
+lapply(glioma_data_adjusted, class)
+```
+
+## Create Dataset: 'analysis'
+
+```{r}
+# Create the analysis dataset
+analysis <- glioma_data_adjusted %>%
+  mutate(
+    # Calculate age at diagnosis and current age
+    Age_at_diagnosis = ifelse(!is.na(DOB) & !is.na(Date_of_first_Glioma_surgery_num),
+                               year(Date_of_first_Glioma_surgery_num) - year(DOB),
+                               NA_integer_),
+    Current_age = year(as.Date("2024-01-01")) - year(DOB),
+
+    # Ensure age takes values between 0 and 9999
+    Current_age = ifelse(Current_age < 0 | Current_age > 9999, NA_integer_, Current_age),
+
+    # Age Unit Handling
+    age_unit = case_when(
+      is.na(Current_age) ~ 'Unknown',
+      Current_age <= 90 ~ 'Years',
+      Current_age > 90 ~ 'Ninety Plus'
+    ),
+    
+    # Set age to missing if age unit is "Unknown" or "Ninety Plus"
+    Current_age = ifelse(age_unit %in% c('Unknown', 'Ninety Plus'),  NA_integer_, Current_age)
+  ) %>%
+  
+  # Convert specific variables in the analysis dataset to factors with labeled categories
+  mutate(
+    Sex = factor(ifelse(Sex %in% c(0, 1), Sex, NA), 
+                 levels = c(0, 1), 
+                 labels = c('Male', 'Female')),
+    Race = factor(ifelse(Race %in% 0:5, Race, NA), 
+                  levels = 0:5, 
+                  labels = c('White', 'Hawaiian', 'Black', 
+                             'American Indian', 'Asian', 
+                             'More than one race')),
+    Hispanic = factor(ifelse(Hispanic %in% c(0, 1), Hispanic, NA), 
+                      levels = c(0, 1), 
+                      labels = c('Not Hispanic', 'Hispanic')),
+    Interview = factor(ifelse(Interview %in% c(0, 1), Interview, NA), 
+                       levels = c(0, 1), 
+                       labels = c('No', 'Yes')),
+    Blood_sample = factor(ifelse(Blood_sample %in% c(0, 1), Blood_sample, NA), 
+                          levels = c(0, 1), 
+                          labels = c('No', 'Yes'))
+  ) %>%
+  
+  # Replace NA levels with 'Unknown'
+  mutate(
+    Sex = fct_na_value_to_level(Sex, level = 'Unknown'),
+    Race = fct_na_value_to_level(Race, level = 'Unknown'),
+    Hispanic = fct_na_value_to_level(Hispanic, level = 'Unknown'),
+    Interview = fct_na_value_to_level(Interview, level = 'Unknown'),
+    Blood_sample = fct_na_value_to_level(Blood_sample, level = 'Unknown')
+  )
+
+# Assign variable labels
+var_label(analysis) <- list(
+  Sex = 'Sex Assigned at Birth',
+  Race = 'Race',
+  Hispanic = 'Hispanic Ethnicity',
+  DOB = 'Date of Birth',
+  Date_of_first_Glioma_surgery_num = 'Date of First Glioma Surgery',
+  Interview = 'Completed an Online Questionnaire',
+  Tumor_counts = 'Number of Tumor Samples Collected',
+  Blood_sample = 'Blood Sample Collected',
+  Age_at_diagnosis = 'Age at Diagnosis',
+  Current_age = 'Current Age',
+  age_unit = 'Age Unit')
+  
+# View the 'analysis' dataset
+head(analysis)
+
+# View the class of each variable
+lapply(analysis, class)
+
+# Retrieve variable labels
+var_label(analysis)
+```
+
+# Create and Export for NIH Report
+
+```{r}
+# Create the analysis dataset for NIH annual report
+analysis1 <- analysis %>%
+  # Retain only the necessary columns and reorder them
+  dplyr::select(Race, Hispanic, Sex, Current_age, age_unit) %>%
+  
+  # Rename the variables as requested by NIH
+  rename(
+    Ethnicity = Hispanic,
+    Gender = Sex,
+    Age = Current_age,
+    "Age Unit" = age_unit
+  )
+
+# Display the contents of the NIH annual report
+print(head(analysis1))
+
+# Print a summary of the data structure
+str(analysis1)
+
+# Export data to CSV file named 'ParticipantLevelData.csv'
+# write.csv(analysis1, file = "ParticipantLevelData.csv", row.names = FALSE)
+```
+
+
+# Create the R-Shiny Dashboard
+
+## 1. Create a Basic Shiny App (Static)
+
+```{r}
+# Define UI for the shiny dashboard
+ui <- dashboardPage(
+  # Dashboard Header with a custom title
+  dashboardHeader(
+    title = span("NIH Glioma Annual Report", style = "font-size: 20px;"), # Adjust font size to fit
+    titleWidth = 300  # Adjust the width as needed to display the full title
+  ),
+  
+  # Sidebar menu for navigating between tabs
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Summary", tabName = "summary", icon = icon("dashboard")),  # Summary tab
+      menuItem("Data Overview", tabName = "data", icon = icon("table")),  # Data overview tab
+      menuItem("Plots", tabName = "plots", icon = icon("bar-chart"))  # Plots tab
+    )
+  ),
+  
+  # Main body of the dashboard
+  dashboardBody(
+    tabItems(
+      # Tab 1: Summary
+      tabItem(tabName = "summary",
+              h2("Annual Report Summary"),  # Heading for the summary tab
+              p("This dashboard summarizes the NIH Glioma study data."), # Description
+              
+              # File input widget for uploading file
+              fileInput("file_input", "Upload Glioma Data File:", accept = ".xls"),
+
+              uiOutput("summary_info"),  # Placeholder for summary information
+              verbatimTextOutput("summary_stats")  # Output for summary statistics
+      ),
+      
+      # Tab 2: Data Overview
+      tabItem(tabName = "data",
+              h2("Data Overview"),  # Heading for data overview tab
+              DT::dataTableOutput("data_table")  # Data table output
+      ),
+      
+      # Tab 3: Plots
+      tabItem(tabName = "plots",
+              h2("Visualizations"),  # Heading for visualizations tab
+              #plotOutput("age_distribution"),  # Output for age distribution plot
+              #plotOutput("demographic_summary"),  # Output for demographic summary plot
+              #plotOutput("gender_pie_chart"),  # Output for gender pie chart
+              #plotOutput("race_pie_chart"),  # Output for race pie chart
+              #plotOutput("ethnicity_pie_chart")  # Output for ethnicity pie chart
+
+              # Buttons for triggering each plot
+              actionButton("age_distribution", "Age Distribution"),
+              actionButton("demographic_summary", "Demographic Summary"),
+              actionButton("gender_pie_chart", "Gender Distribution"),
+              actionButton("race_pie_chart", "Race Distribution"),
+              actionButton("ethnicity_pie_chart", "Ethnicity Distribution"),
+            
+              # Dynamic UI to display the selected plot
+              uiOutput("plot_ui")
+      )
+    )
+  )
+)
+
+# Define server logic for the shiny dashboard
+server <- function(input, output, session) {
+  
+  # Reactive values to keep track of active plots
+  active_plot <- reactiveVal(NULL)
+  
+  observeEvent(input$age_distribution, {
+    active_plot("age_distribution")
+  })
+  
+  observeEvent(input$demographic_summary, {
+    active_plot("demographic_summary")
+  })
+  
+  observeEvent(input$gender_pie_chart, {
+    active_plot("gender_pie_chart")
+  })
+  
+  observeEvent(input$race_pie_chart, {
+    active_plot("race_pie_chart")
+  })
+  
+  observeEvent(input$ethnicity_pie_chart, {
+    active_plot("ethnicity_pie_chart")
+  })
+  
+  output$plot_ui <- renderUI({
+    # Based on the active plot, render the corresponding plot
+    req(active_plot())
+    
+    if (active_plot() == "age_distribution") {
+      plotOutput("age_distribution")
+    } else if (active_plot() == "demographic_summary") {
+      plotOutput("demographic_summary")
+    } else if (active_plot() == "gender_pie_chart") {
+      plotOutput("gender_pie_chart")
+    } else if (active_plot() == "race_pie_chart") {
+      plotOutput("race_pie_chart")
+    } else if (active_plot() == "ethnicity_pie_chart") {
+      plotOutput("ethnicity_pie_chart")
+    }
+  })
+    
+  # Load and process data when a file is uploaded
+  data <- reactive({
+    # Ensure a file is uploaded
+    req(input$file_input)
+    # Import the xls file into R data frame
+    glioma_data <- read_excel(input$file_input$datapath, sheet = "Glioma", range = "A1:H201")
+    
+    # Rename columns for convenience
+    colnames(glioma_data) <- c("Sex", "Race", "Hispanic", "Date_of_first_Glioma_surgery",  
+                               "Interview", "Tumor_counts", "DOB", "Blood_sample")
+    
+    # Convert Date_of_first_Glioma_surgery to Date format
+    glioma_data_adjusted <- glioma_data %>% 
+      mutate(
+        Date_of_first_Glioma_surgery = str_trim(Date_of_first_Glioma_surgery),
+        Date_of_first_Glioma_surgery_num = case_when(
+          is.na(Date_of_first_Glioma_surgery) ~ as.Date(NA),
+          !str_detect(Date_of_first_Glioma_surgery, "/") ~ 
+            as.Date(as.numeric(Date_of_first_Glioma_surgery), origin = "1899-12-30"),
+          str_detect(Date_of_first_Glioma_surgery, "^9/99/") ~ 
+            as.Date(paste0("01/01/", substr(Date_of_first_Glioma_surgery, 6, 9)), format = "%m/%d/%Y"),
+          Date_of_first_Glioma_surgery == "06/08/2018" ~ as.Date("2018-06-08"),
+          TRUE ~ as.Date(Date_of_first_Glioma_surgery, format = "%m/%d/%Y")
+        ),
+        DOB = as.Date(DOB),
+        Hispanic = as.numeric(na_if(Hispanic, "0?"))
+      ) %>% 
+      dplyr::select(-Date_of_first_Glioma_surgery)
+    
+    # Create the analysis dataset
+    analysis <- glioma_data_adjusted %>%
+      mutate(
+        # Calculate age at diagnosis and current age
+        Age_at_diagnosis = ifelse(!is.na(DOB) & !is.na(Date_of_first_Glioma_surgery_num),
+                                  year(Date_of_first_Glioma_surgery_num) - year(DOB),
+                                  NA_integer_),
+        Current_age = year(as.Date("2024-01-01")) - year(DOB),
+        # Ensure age takes values between 0 and 9999
+        Current_age = ifelse(Current_age < 0 | Current_age > 9999, NA_integer_, Current_age),
+        # Age Unit Handling
+        age_unit = case_when(
+          is.na(Current_age) ~ 'Unknown',
+          Current_age <= 90 ~ 'Years',
+          Current_age > 90 ~ 'Ninety Plus'
+        ),
+        # Set age to missing if age unit is "Unknown" or "Ninety Plus"
+        Current_age = ifelse(age_unit %in% c('Unknown', 'Ninety Plus'), NA_integer_, Current_age)
+      ) %>%
+      
+      # Convert specific variables in the analysis dataset to factors with labeled categories
+      mutate(
+        Sex = factor(ifelse(Sex %in% c(0, 1), Sex, NA), levels = c(0, 1), labels = c('Male', 'Female')),
+        Race = factor(ifelse(Race %in% 0:5, Race, NA), levels = 0:5, 
+                      labels = c('White', 'Hawaiian', 'Black', 'American Indian', 'Asian', 'More than one race')),
+        Hispanic = factor(ifelse(Hispanic %in% c(0, 1), Hispanic, NA), levels = c(0, 1), 
+                          labels = c('Not Hispanic', 'Hispanic')),
+        Interview = factor(ifelse(Interview %in% c(0, 1), Interview, NA), levels = c(0, 1), 
+                           labels = c('No', 'Yes')),
+        Blood_sample = factor(ifelse(Blood_sample %in% c(0, 1), Blood_sample, NA), levels = c(0, 1), 
+                              labels = c('No', 'Yes'))
+      ) %>%
+      
+      # Replace NA levels with 'Unknown' in factor variables
+      mutate(
+        Sex = fct_na_value_to_level(Sex, level = 'Unknown'),
+        Race = fct_na_value_to_level(Race, level = 'Unknown'),
+        Hispanic = fct_na_value_to_level(Hispanic, level = 'Unknown'),
+        Interview = fct_na_value_to_level(Interview, level = 'Unknown'),
+        Blood_sample = fct_na_value_to_level(Blood_sample, level = 'Unknown')
+      )
+    
+    # Assign variable labels
+    var_label(analysis) <- list(
+      Sex = 'Sex Assigned at Birth',
+      Race = 'Race',
+      Hispanic = 'Hispanic Ethnicity',
+      DOB = 'Date of Birth',
+      Date_of_first_Glioma_surgery_num = 'Date of First Glioma Surgery',
+      Interview = 'Completed an Online Questionnaire',
+      Tumor_counts = 'Number of Tumor Samples Collected',
+      Blood_sample = 'Blood Sample Collected',
+      Age_at_diagnosis = 'Age at Diagnosis',
+      Current_age = 'Current Age',
+      age_unit = 'Age Unit')
+    
+    # Retain only necessary columns and rename them for the NIH report
+    analysis1 <- analysis %>%
+      # Only select necessary columns and reorder them
+      dplyr::select(Race, Hispanic, Sex, Current_age, age_unit) %>%
+      # Rename the variables as requested by NIH
+      rename(
+        Ethnicity = Hispanic,
+        Gender = Sex,
+        Age = Current_age,
+        "Age Unit" = age_unit
+      )
+    
+    analysis1  # Final dataset
+
+  })
+
+  # Display formatted summary information
+  output$summary_info <- renderUI({
+    req(data())  # Ensure data is available
+    HTML(paste(
+      "<b>Total Participants:</b>", nrow(data()), "<br>",  # Display total number of participants
+      "<b>Mean Age:</b>", round(mean(data()$Age, na.rm = TRUE)), "<br>",   # Display mean age
+      "<b>Median Age:</b>", round(median(data()$Age, na.rm = TRUE)), "<br>",  # Display median age
+      "<b>Standard Deviation of Age:</b>", 
+      round(sd(data()$Age, na.rm = TRUE)), "<br>",  # Display age standard deviation
+      "<b>Race Distribution:</b><br>",
+      paste(names(table(data()$Race)), table(data()$Race), sep = ": ", 
+            collapse = "<br>"), "<br>",  # Display race distribution
+      "<b>Ethnicity Distribution:</b><br>",
+      paste(names(table(data()$Ethnicity)), table(data()$Ethnicity), sep = ": ", 
+            collapse = "<br>"), "<br>",  # Display ethnicity distribution
+      "<b>Gender Distribution:</b><br>",
+      paste(names(table(data()$Gender)), table(data()$Gender), sep = ": ", 
+            collapse = "<br>")  # Display gender distribution
+    ))
+  }) 
+  
+  # Display summary statistics of the dataset
+  output$summary_stats <- renderPrint({
+    req(data())  # Ensure data is available
+    summary(data())  # Display summary statistics of the data
+  })
+  
+  # Render Data Table
+  output$data_table <- renderDT({
+    # Create a data table with options
+    datatable(data(), options = list(pageLength = 10, autoWidth = TRUE), rownames = FALSE)
+  })
+  
+  # Prepare data for plots by removing non-finite values
+  data_clean <- reactive({
+    data() %>% filter(is.finite(Age))  # Filter data to include only finite ages
+  })
+
+  # Plot age distribution histogram
+  output$age_distribution <- renderPlot({
+    req(data_clean())  # Ensure clean data is available
+    if (nrow(data_clean()) == 0) return(NULL)  # Return NULL if no data to plot
+    ggplot(data_clean(), aes(x = Age)) +  # Create histogram for age distribution
+      geom_histogram(binwidth = 5, fill = "skyblue", color = "white") +  # Customize histogram appearance
+      labs(title = "Current Age Distribution", x = "Age", y = "Frequency") +  # Set titles and labels
+      theme_bw() +  # Apply a theme
+      theme(
+        axis.text.x = element_text(size = 12, color = "black"),  # Customize x-axis text
+        axis.text.y = element_text(size = 12, color = "black"),  # Customize y-axis text
+        axis.title.x = element_text(size = 14),  # Customize x-axis title
+        axis.title.y = element_text(size = 14),  # Customize y-axis title
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold")  # Customize plot title
+      )
+  })
+
+  # Render demographic summary bar plot
+  output$demographic_summary <- renderPlot({
+    data_demographics <- data() %>%
+      group_by(Gender, Race, Ethnicity) %>%
+      summarise(Count = n(), .groups = "drop")  # Summarize demographic data by gender, race, and ethnicity
+    
+    req(data_demographics)  # Ensure demographic data is available
+    if (nrow(data_demographics) == 0) return(NULL)  # Return NULL if no data to plot
+    
+    ggplot(data_demographics, aes(x = Race, y = Count, fill = Gender)) +  # Create bar plot for demographics
+      geom_bar(stat = "identity", position = position_dodge()) +  # Customize bar plot appearance
+      facet_wrap(~ Ethnicity) +  # Create separate panels for each ethnicity
+      labs(title = "Demographic Summary", x = "Race", y = "Count") +  # Set titles and labels
+      theme_bw() +  # Apply a theme
+      theme(
+        axis.text.x = element_text(size = 12, color = "black", 
+                                   angle = 45, hjust = 1),        # Customize x-axis text with rotation
+        axis.text.y = element_text(size = 12, color = "black"),   # Customize y-axis text
+        axis.title.x = element_text(size = 15),  # Customize x-axis title
+        axis.title.y = element_text(size = 15),  # Customize y-axis title
+        strip.text = element_text(size = 14, color = "black"),  # Customize facet label text
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),      # Customize plot title
+        legend.text = element_text(size = 12, color = "black"), # Customize legend text
+        legend.title = element_text(size = 12, color = "black") # Customize legend title
+      )
+  })
+  
+  # Plot gender identity pie chart
+  output$gender_pie_chart <- renderPlot({
+    gender_data <- data() %>% 
+      group_by(Gender) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize gender data
+
+    req(gender_data)  # Ensure gender data is available
+    if (nrow(gender_data) == 0) return(NULL)  # Return NULL if no data to plot
+
+    # Calculate the percentage for each gender segment
+    gender_data <- gender_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(gender_data, aes(x = 2, y = Count, fill = Gender)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Gender Identity Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+  
+  # Plot race pie chart
+  output$race_pie_chart <- renderPlot({
+    race_data <- data() %>% 
+      group_by(Race) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize race data
+  
+    req(race_data)  # Ensure race data is available
+    if (nrow(race_data) == 0) return(NULL)  # Return NULL if no data to plot
+  
+    # Calculate percentage for each race segment
+    race_data <- race_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(race_data, aes(x = 2, y = Count, fill = Race)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Race Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      scale_fill_brewer(palette = "Set3") +  # Set color palette
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+  
+  # Plot ethnicity pie chart
+  output$ethnicity_pie_chart <- renderPlot({
+    ethnicity_data <- data() %>% 
+      group_by(Ethnicity) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize ethnicity data
+  
+    req(ethnicity_data)  # Ensure ethnicity data is available
+    if (nrow(ethnicity_data) == 0) return(NULL)  # Return NULL if no data to plot
+  
+    # Calculate percentage for each ethnicity segment
+    ethnicity_data <- ethnicity_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(ethnicity_data, aes(x = 2, y = Count, fill = Ethnicity)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Ethnicity Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      scale_fill_brewer(palette = "Accent") +  # Set color palette
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+}
+
+# Run the Shiny application
+shinyApp(ui = ui, server = server)
+```
+
+## 2. Create an Interactive, Yearly-Updatable Shiny App (Dynamic)
+
+```{r}
+# Define UI for the shiny dashboard
+ui <- dashboardPage(
+  # Dashboard Header with a custom title
+  dashboardHeader(
+    title = span("NIH Glioma Annual Report", style = "font-size: 20px;"), # Adjust font size to fit
+    titleWidth = 300  # Adjust the width as needed to display the full title
+  ),
+  
+  # Sidebar menu for navigating between tabs
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Summary", tabName = "summary", icon = icon("dashboard")),  # Summary tab
+      menuItem("Data Overview", tabName = "data", icon = icon("table")),  # Data overview tab
+      menuItem("Plots", tabName = "plots", icon = icon("bar-chart"))  # Plots tab
+    )
+  ),
+  
+  # Main body of the dashboard
+  dashboardBody(
+    tabItems(
+      # Tab 1: Summary
+      tabItem(tabName = "summary",
+              h2("Annual Report Summary"),  # Heading for the summary tab
+              p("This dashboard summarizes the NIH Glioma study data for the reporting year."), # Description
+              
+              # File input widget for uploading file
+              fileInput("file_input", "Upload Glioma Data File:", accept = ".xls"),
+              
+              # Year input widget and button to load filtered data
+              numericInput("year", "Select Reporting Year:", 
+                           value = 2024, min = 1900, max = year(Sys.Date())),  # Input for year selection
+              # Subline for the reporting year input
+              HTML("<p style='font-size: 12px; color: gray; margin-top: -10px;'>
+                   Note: Data is filtered based on the selected year of the first Glioma surgery.</p>"),
+              
+              # Button to confirm the selected year and load data
+              actionButton("input_year", "Load Data for Selected Year"),
+              
+              # Outputs for summary information and summary statistics
+              uiOutput("summary_info"),  # Placeholder for summary information
+              verbatimTextOutput("summary_stats")  # Output for summary statistics
+      ),
+      
+      # Tab 2: Data Overview
+      tabItem(tabName = "data",
+              h2("Data Overview"),  # Heading for data overview tab
+              DT::dataTableOutput("data_table")  # Data table output
+      ),
+      
+      # Tab 3: Plots
+      tabItem(tabName = "plots",
+              h2("Visualizations"),  # Heading for visualizations tab
+              plotOutput("age_distribution"),  # Output for age distribution plot
+              plotOutput("demographic_summary"),  # Output for demographic summary plot
+              plotOutput("gender_pie_chart"),  # Output for gender pie chart
+              plotOutput("race_pie_chart"),  # Output for race pie chart
+              plotOutput("ethnicity_pie_chart")  # Output for ethnicity pie chart
+      )
+    )
+  )
+)
+
+# Define server logic for the integrated dashboard
+server <- function(input, output, session) {
+  
+  # Reactive data loading based on uploaded file
+  glioma_data <- reactive({
+    req(input$file_input)  # Ensure file is uploaded
+    # Import the xls file into R data frame
+    data <- read_excel(input$file_input$datapath, sheet = "Glioma", range = "A1:H201")
+    
+    # Rename columns for convenience
+    colnames(data) <- c("Sex", "Race", "Hispanic", "Date_of_first_Glioma_surgery",  
+                        "Interview", "Tumor_counts", "DOB", "Blood_sample")
+    
+    # Process dates and clean columns
+    data_adjusted <- data %>% 
+      mutate(
+        # Trim whitespace from Date_of_first_Glioma_surgery
+        Date_of_first_Glioma_surgery = str_trim(Date_of_first_Glioma_surgery),
+        
+        # Convert Date_of_first_Glioma_surgery to Date format with various cases
+        Date_of_first_Glioma_surgery_num = case_when(
+          is.na(Date_of_first_Glioma_surgery) ~ as.Date(NA),
+          !str_detect(Date_of_first_Glioma_surgery, "/") ~ 
+            as.Date(as.numeric(Date_of_first_Glioma_surgery), origin = "1899-12-30"),
+          str_detect(Date_of_first_Glioma_surgery, "^9/99/") ~ 
+            as.Date(paste0("01/01/", substr(Date_of_first_Glioma_surgery, 6, 9)), format = "%m/%d/%Y"),
+          Date_of_first_Glioma_surgery == "06/08/2018" ~ as.Date("2018-06-08"),
+          TRUE ~ as.Date(Date_of_first_Glioma_surgery, format = "%m/%d/%Y")
+        ),
+        
+        # Convert DOB to Date format
+        DOB = as.Date(DOB, origin = "1899-12-30"),
+        
+        # Handle Hispanic column: convert to numeric, replace "0?" with NA
+        Hispanic = as.numeric(na_if(Hispanic, "0?"))
+      ) %>% 
+      
+      # Remove the original Date_of_first_Glioma_surgery column to avoid redundancy
+      dplyr::select(-Date_of_first_Glioma_surgery)
+    
+    return(data_adjusted)  # Return the cleaned data
+  })
+
+  # Load required dataset for the dashboard
+  load_data <- function(year) {
+    # Filter and manipulate the glioma dataset based on the selected year
+    data <- glioma_data() %>% 
+      
+      # Filter the data based on the selected year
+      filter(year(Date_of_first_Glioma_surgery_num) == year) %>%
+      
+      # Calculate ages based on the selected year
+      mutate(
+        Age_at_diagnosis = ifelse(
+          !is.na(DOB) & !is.na(Date_of_first_Glioma_surgery_num), 
+          year(Date_of_first_Glioma_surgery_num) - year(DOB), NA_integer_),
+        Current_age = year(as.Date("2024-01-01")) - year(DOB),
+        
+        # Ensure age takes values between 0 and 9999
+        Current_age = ifelse(Current_age < 0 | Current_age > 9999, NA_integer_, Current_age),
+  
+        # Age Unit Handling
+        age_unit = case_when(
+          is.na(Current_age) ~ 'Unknown',
+          Current_age <= 90 ~ 'Years',
+          Current_age > 90 ~ 'Ninety Plus'
+          ),
+        
+        # Set age to missing if age unit is "Unknown" or "Ninety Plus"
+        Current_age = ifelse(age_unit %in% c('Unknown', 'Ninety Plus'),  NA_integer_, Current_age)
+      ) %>%
+      
+      # Convert to factors with appropriate labels
+      mutate(
+        Sex = factor(ifelse(Sex %in% c(0, 1), Sex, NA), 
+                   levels = c(0, 1), 
+                   labels = c('Male', 'Female')),
+        Race = factor(ifelse(Race %in% 0:5, Race, NA), 
+                      levels = 0:5, 
+                      labels = c('White', 'Hawaiian', 'Black', 
+                                 'American Indian', 'Asian', 
+                                 'More than one race')),
+        Hispanic = factor(ifelse(Hispanic %in% c(0, 1), Hispanic, NA), 
+                          levels = c(0, 1), 
+                          labels = c('Not Hispanic', 'Hispanic')),
+        Interview = factor(ifelse(Interview %in% c(0, 1), Interview, NA), 
+                           levels = c(0, 1), 
+                           labels = c('No', 'Yes')),
+        Blood_sample = factor(ifelse(Blood_sample %in% c(0, 1), Blood_sample, NA), 
+                              levels = c(0, 1), 
+                              labels = c('No', 'Yes'))
+      ) %>%
+      
+      # Replace NA levels with 'Unknown' in factor variables
+      mutate(
+        Sex = fct_na_value_to_level(Sex, level = "Unknown"),
+        Race = fct_na_value_to_level(Race, level = "Unknown"),
+        Hispanic = fct_na_value_to_level(Hispanic, level = "Unknown"),
+        Interview = fct_na_value_to_level(Interview, level = "Unknown"),
+        Blood_sample = fct_na_value_to_level(Blood_sample, level = "Unknown")
+      )
+    
+    # Retain only necessary columns and rename them for the NIH report
+    data_final <- data %>%
+      
+      # Only select necessary columns and reorder them
+      dplyr::select(Race, Hispanic, Sex, Current_age, age_unit) %>%
+    
+      # Rename the variables as requested by NIH
+      rename(
+        Ethnicity = Hispanic,
+        Gender = Sex,
+        Age = Current_age,
+        "Age Unit" = age_unit
+      )
+  
+    return(data_final)  # Return the final cleaned dataset
+  }
+
+  # Reactive data filtering based on selected year
+  data <- eventReactive(input$input_year, {
+    req(glioma_data(), input$year)  # Ensure file and year are provided
+    load_data(input$year)
+  })
+
+  # Display formatted summary information
+  output$summary_info <- renderUI({
+    req(data())  # Ensure data is available
+    HTML(paste(
+      "<b>Report for year:</b>", input$year, "<br>",  # Display selected year
+      "<b>Total Participants:</b>", nrow(data()), "<br>",  # Display total number of participants
+      "<b>Mean Age:</b>", round(mean(data()$Age, na.rm = TRUE)), "<br>",   # Display mean age
+      "<b>Median Age:</b>", round(median(data()$Age, na.rm = TRUE)), "<br>",  # Display median age
+      "<b>Standard Deviation of Age:</b>", 
+      round(sd(data()$Age, na.rm = TRUE)), "<br>",  # Display age standard deviation
+      "<b>Race Distribution:</b><br>",
+      paste(names(table(data()$Race)), table(data()$Race), sep = ": ", 
+            collapse = "<br>"), "<br>",  # Display race distribution
+      "<b>Ethnicity Distribution:</b><br>",
+      paste(names(table(data()$Ethnicity)), table(data()$Ethnicity), sep = ": ", 
+            collapse = "<br>"), "<br>",  # Display ethnicity distribution
+      "<b>Gender Distribution:</b><br>",
+      paste(names(table(data()$Gender)), table(data()$Gender), sep = ": ", 
+            collapse = "<br>")  # Display gender distribution
+    ))
+  })  
+
+  # Display summary statistics of the dataset
+  output$summary_stats <- renderPrint({
+    req(data())  # Ensure data is available
+    summary(data())  # Display summary statistics of the data
+  })
+
+  # Render Data Table
+  output$data_table <- renderDT({
+    # Create a data table with options
+    datatable(data(), options = list(pageLength = 10, autoWidth = TRUE), rownames = FALSE)
+  })
+  
+  # Prepare data for plots by removing non-finite values
+  data_clean <- reactive({
+    data() %>% filter(is.finite(Age))  # Filter data to include only finite ages
+  })
+
+  # Plot age distribution histogram
+  output$age_distribution <- renderPlot({
+    req(data_clean())  # Ensure clean data is available
+    if (nrow(data_clean()) == 0) return(NULL)  # Return NULL if no data to plot
+    ggplot(data_clean(), aes(x = Age)) +  # Create histogram for age distribution
+      geom_histogram(binwidth = 5, fill = "skyblue", color = "white") +  # Customize histogram appearance
+      labs(title = "Current Age Distribution", x = "Age", y = "Frequency") +  # Set titles and labels
+      theme_bw() +  # Apply a theme
+      theme(
+        axis.text.x = element_text(size = 12, color = "black"),  # Customize x-axis text
+        axis.text.y = element_text(size = 12, color = "black"),  # Customize y-axis text
+        axis.title.x = element_text(size = 14),  # Customize x-axis title
+        axis.title.y = element_text(size = 14),  # Customize y-axis title
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold")  # Customize plot title
+      )
+  })
+
+  # Render demographic summary bar plot
+  output$demographic_summary <- renderPlot({
+    data_demographics <- data() %>%
+      group_by(Gender, Race, Ethnicity) %>%
+      summarise(Count = n(), .groups = "drop")  # Summarize demographic data by gender, race, and ethnicity
+    
+    req(data_demographics)  # Ensure demographic data is available
+    if (nrow(data_demographics) == 0) return(NULL)  # Return NULL if no data to plot
+    
+    ggplot(data_demographics, aes(x = Race, y = Count, fill = Gender)) +  # Create bar plot for demographics
+      geom_bar(stat = "identity", position = position_dodge()) +  # Customize bar plot appearance
+      facet_wrap(~ Ethnicity) +  # Create separate panels for each ethnicity
+      labs(title = "Demographic Summary", x = "Race", y = "Count") +  # Set titles and labels
+      theme_bw() +  # Apply a theme
+      theme(
+        axis.text.x = element_text(size = 12, color = "black", 
+                                   angle = 45, hjust = 1),        # Customize x-axis text with rotation
+        axis.text.y = element_text(size = 12, color = "black"),   # Customize y-axis text
+        axis.title.x = element_text(size = 15),  # Customize x-axis title
+        axis.title.y = element_text(size = 15),  # Customize y-axis title
+        strip.text = element_text(size = 14, color = "black"),  # Customize facet label text
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),      # Customize plot title
+        legend.text = element_text(size = 12, color = "black"), # Customize legend text
+        legend.title = element_text(size = 12, color = "black") # Customize legend title
+      )
+  })
+  
+  # Plot gender identity pie chart
+  output$gender_pie_chart <- renderPlot({
+    gender_data <- data() %>% 
+      group_by(Gender) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize gender data
+
+    req(gender_data)  # Ensure gender data is available
+    if (nrow(gender_data) == 0) return(NULL)  # Return NULL if no data to plot
+
+    # Calculate the percentage for each gender segment
+    gender_data <- gender_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(gender_data, aes(x = 2, y = Count, fill = Gender)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Gender Identity Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+  
+  # Plot race pie chart
+  output$race_pie_chart <- renderPlot({
+    race_data <- data() %>% 
+      group_by(Race) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize race data
+  
+    req(race_data)  # Ensure race data is available
+    if (nrow(race_data) == 0) return(NULL)  # Return NULL if no data to plot
+  
+    # Calculate percentage for each race segment
+    race_data <- race_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(race_data, aes(x = 2, y = Count, fill = Race)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Race Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      scale_fill_brewer(palette = "Set3") +  # Set color palette
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+  
+  # Plot ethnicity pie chart
+  output$ethnicity_pie_chart <- renderPlot({
+    ethnicity_data <- data() %>% 
+      group_by(Ethnicity) %>% 
+      summarise(Count = n(), .groups = "drop")  # Summarize ethnicity data
+  
+    req(ethnicity_data)  # Ensure ethnicity data is available
+    if (nrow(ethnicity_data) == 0) return(NULL)  # Return NULL if no data to plot
+  
+    # Calculate percentage for each ethnicity segment
+    ethnicity_data <- ethnicity_data %>% 
+      mutate(Percentage = Count / sum(Count))  # Calculate percentages
+  
+    ggplot(ethnicity_data, aes(x = 2, y = Count, fill = Ethnicity)) +  # Set x to a fixed value to make a ring
+      geom_bar(width = 1, stat = "identity") +  # Set bar width to create donut shape
+      coord_polar("y", start = 0) +  # Transform to pie chart using polar coordinates
+      xlim(0.5, 2.5) +  # Set limits to create empty center
+      labs(title = "Ethnicity Distribution") +  # Set plot title
+      theme_void() +  # Apply a theme with minimal styling
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),  # Center-align and size title
+        legend.title = element_text(size = 12, color = "black"),  # Style legend title
+        legend.text = element_text(size = 12, color = "black")  # Style legend text
+      ) +
+      scale_fill_brewer(palette = "Accent") +  # Set color palette
+      # Add percentages for each category inside the donut
+      geom_text(aes(label = percent(Percentage)), 
+                position = position_stack(vjust = 0.5), color = "black", size = 5, fontface = "bold")
+  })
+}
+
+# Run the integrated Shiny application
+shinyApp(ui = ui, server = server)
+```
+
